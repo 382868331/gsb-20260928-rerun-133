@@ -1,0 +1,196 @@
+package server
+
+import (
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"strconv"
+	"sync"
+
+	"debugservice/internal/executor"
+	"debugservice/internal/session"
+)
+
+type Server struct {
+	mu       sync.Mutex
+	sessions map[string]*session.Session
+}
+
+func New() *Server {
+	return &Server{sessions: map[string]*session.Session{}}
+}
+
+func (s *Server) Routes() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /programs", s.listPrograms)
+	mux.HandleFunc("POST /sessions", s.createSession)
+	mux.HandleFunc("GET /sessions/{id}", s.withSession(s.getSession))
+	mux.HandleFunc("POST /sessions/{id}/wait", s.withSession(s.waitSession))
+	mux.HandleFunc("POST /sessions/{id}/continue", s.withSession(s.continueSession))
+	mux.HandleFunc("POST /sessions/{id}/pause", s.withSession(s.pauseSession))
+	mux.HandleFunc("POST /sessions/{id}/breakpoints", s.withSession(s.setBreakpoints))
+	mux.HandleFunc("POST /sessions/{id}/variables", s.withSession(s.variables))
+	return logging(mux)
+}
+
+func (s *Server) listPrograms(w http.ResponseWriter, _ *http.Request) {
+	programs := executor.BuiltinPrograms()
+	names := make([]string, 0, len(programs))
+	for name := range programs {
+		names = append(names, name)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"programs": names})
+}
+
+func (s *Server) createSession(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Program     string `json:"program"`
+		Breakpoints []int  `json:"breakpoints"`
+	}
+	if err := decodeBody(r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	programs := executor.BuiltinPrograms()
+	program, ok := programs[body.Program]
+	if !ok {
+		writeError(w, http.StatusNotFound, errors.New("unknown program"))
+		return
+	}
+	s.mu.Lock()
+	id := strconv.Itoa(len(s.sessions) + 1)
+	engine := executor.NewVirtual(program)
+	sess := session.New(id, engine)
+	s.sessions[id] = sess
+	s.mu.Unlock()
+	if len(body.Breakpoints) > 0 {
+		_, _ = sess.SetBreakpoints(body.Breakpoints)
+	}
+	writeJSON(w, http.StatusCreated, sess.Snapshot())
+}
+
+type handler func(http.ResponseWriter, *http.Request, *session.Session)
+
+func (s *Server) withSession(h handler) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		s.mu.Lock()
+		sess := s.sessions[r.PathValue("id")]
+		s.mu.Unlock()
+		if sess == nil {
+			writeError(w, http.StatusNotFound, errors.New("unknown session"))
+			return
+		}
+		h(w, r, sess)
+	}
+}
+
+func (s *Server) getSession(w http.ResponseWriter, _ *http.Request, sess *session.Session) {
+	writeJSON(w, http.StatusOK, sess.Snapshot())
+}
+
+func (s *Server) waitSession(w http.ResponseWriter, _ *http.Request, sess *session.Session) {
+	writeJSON(w, http.StatusOK, sess.Wait())
+}
+
+func (s *Server) continueSession(w http.ResponseWriter, r *http.Request, sess *session.Session) {
+	var body struct {
+		PauseID int `json:"pauseId"`
+	}
+	if err := decodeBody(r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	result, err := sess.Continue(body.PauseID)
+	if err != nil {
+		writeSessionError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) pauseSession(w http.ResponseWriter, _ *http.Request, sess *session.Session) {
+	result, err := sess.Pause()
+	if err != nil {
+		writeSessionError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) setBreakpoints(w http.ResponseWriter, r *http.Request, sess *session.Session) {
+	var body struct {
+		Lines []int `json:"lines"`
+	}
+	if err := decodeBody(r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	result, err := sess.SetBreakpoints(body.Lines)
+	if err != nil {
+		writeSessionError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) variables(w http.ResponseWriter, r *http.Request, sess *session.Session) {
+	var body struct {
+		PauseID int      `json:"pauseId"`
+		Names   []string `json:"names"`
+	}
+	if err := decodeBody(r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	result, err := sess.Variables(body.PauseID, body.Names)
+	if err != nil {
+		writeSessionError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"vars": result})
+}
+
+func writeSessionError(w http.ResponseWriter, err error) bool {
+	if err == nil {
+		return true
+	}
+	status := http.StatusInternalServerError
+	switch {
+	case errors.Is(err, session.ErrRunning):
+		status = http.StatusConflict
+	case errors.Is(err, session.ErrTerminated):
+		status = http.StatusGone
+	case errors.Is(err, session.ErrPauseMismatch), errors.Is(err, session.ErrInvalidPause):
+		status = http.StatusConflict
+	default:
+		writeError(w, status, err)
+		return false
+	}
+	writeError(w, status, err)
+	return false
+}
+
+func decodeBody(r *http.Request, target any) error {
+	if r.Body == nil {
+		return nil
+	}
+	defer r.Body.Close()
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	err := decoder.Decode(target)
+	if errors.Is(err, io.EOF) {
+		return nil
+	}
+	return err
+}
+
+func writeJSON(w http.ResponseWriter, status int, value any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(value)
+}
+
+func writeError(w http.ResponseWriter, status int, err error) {
+	writeJSON(w, status, map[string]string{"error": err.Error()})
+}
