@@ -24,12 +24,13 @@ const (
 
 // Snapshot is an immutable view emitted for one state transition.
 type Snapshot struct {
-	State   State            `json:"state"`
-	Reason  string           `json:"reason,omitempty"`
-	PauseID int              `json:"pauseId,omitempty"`
-	Line    int              `json:"line,omitempty"`
-	PC      int              `json:"pc,omitempty"`
-	Vars    map[string]int64 `json:"vars,omitempty"`
+	State     State            `json:"state"`
+	Reason    string           `json:"reason,omitempty"`
+	PauseID   int              `json:"pauseId,omitempty"`
+	Line      int              `json:"line,omitempty"`
+	PC        int              `json:"pc,omitempty"`
+	Vars      map[string]int64 `json:"vars,omitempty"`
+	LastPause *Snapshot        `json:"lastPause,omitempty"`
 }
 
 type WaitResult = Snapshot
@@ -47,7 +48,8 @@ type Engine interface {
 type waiter chan WaitResult
 
 type command struct {
-	apply func(*Session)
+	apply  func(*Session)
+	closer bool
 }
 
 // Session serializes every request in one event loop. Continue and variable
@@ -60,6 +62,15 @@ type Session struct {
 	cmds       chan command
 	done       chan struct{}
 	terminated chan struct{}
+	closeOnce  sync.Once
+	// submitMu guards closing and pairs admission with teardown. A command
+	// admitted by submit is always consumed by the loop, so no request is
+	// stranded in cmds when the executor exits.
+	submitMu sync.Mutex
+	closing  bool
+	inflight sync.WaitGroup
+	// terminalMu serializes requests answered directly after the loop exits.
+	terminalMu sync.Mutex
 	readyWG    sync.WaitGroup
 	readyDone  bool
 	wg         sync.WaitGroup
@@ -70,6 +81,7 @@ type Session struct {
 	line       int
 	vars       map[string]int64
 	pauseID    int
+	lastPause  *Snapshot
 	breakpoint map[int]bool
 }
 
@@ -104,33 +116,61 @@ func (s *Session) loop(events <-chan executor.Event) {
 		select {
 		case event := <-events:
 			s.onEvent(event)
-			if s.state == StateTerminated {
-				s.drainCommands()
-				return
-			}
 			continue
 		default:
 		}
 		select {
 		case event := <-events:
 			s.onEvent(event)
-			if s.state == StateTerminated {
-				s.drainCommands()
+		case cmd := <-s.cmds:
+			if cmd.closer {
+				s.handleClose(events)
 				return
 			}
-		case cmd := <-s.cmds:
 			cmd.apply(s)
 		}
 	}
 }
 
-func (s *Session) drainCommands() {
+// handleClose shuts a live executor down, waits for its terminal event, and
+// then tears the loop down. A close while already terminated tears down right
+// away, so Shutdown always releases the session.
+func (s *Session) handleClose(events <-chan executor.Event) {
+	if s.state != StateTerminated {
+		s.engine.Shutdown()
+		for s.state != StateTerminated {
+			select {
+			case event := <-events:
+				s.onEvent(event)
+			case cmd := <-s.cmds:
+				if !cmd.closer {
+					cmd.apply(s)
+				}
+			}
+		}
+	}
+	s.teardown(events)
+}
+
+// teardown stops admitting new commands, waits for every admitted command to
+// be consumed, and drains the channel defensively. Commands racing with the
+// switch observe closing and answer directly from submit.
+func (s *Session) teardown(events <-chan executor.Event) {
+	s.submitMu.Lock()
+	s.closing = true
+	s.submitMu.Unlock()
+	s.inflight.Wait()
+drain:
 	for {
 		select {
 		case cmd := <-s.cmds:
-			cmd.apply(s)
+			if cmd.apply != nil {
+				cmd.apply(s)
+			}
+		case event := <-events:
+			s.onEvent(event)
 		default:
-			return
+			break drain
 		}
 	}
 }
@@ -144,18 +184,23 @@ func (s *Session) onEvent(event executor.Event) {
 		s.line = event.Line
 		s.vars = cloneVars(event.Vars)
 		s.pauseID = event.PauseID
+		s.lastPause = &Snapshot{
+			State: StateStopped, Reason: event.Reason, PauseID: event.PauseID,
+			Line: event.Line, PC: event.PC, Vars: cloneVars(event.Vars),
+		}
 		s.notify(Snapshot{
 			State: StateStopped, Reason: event.Reason, PauseID: s.pauseID,
 			Line: event.Line, PC: event.PC, Vars: cloneVars(event.Vars),
+			LastPause: s.lastPauseRef(),
 		})
 	case executor.EventTerminated:
 		s.state = StateTerminated
 		s.reason = event.Reason
 		s.pc = event.PC
 		s.line = event.Line
-		s.vars = event.Vars
+		s.vars = cloneVars(event.Vars)
 		s.pauseID = 0
-		s.notify(WaitResult{State: StateTerminated, Reason: event.Reason, Line: event.Line})
+		s.notify(WaitResult{State: StateTerminated, Reason: event.Reason, Line: event.Line, LastPause: s.lastPauseRef()})
 		for w := range s.waiters {
 			s.deliver(w)
 		}
@@ -177,21 +222,44 @@ func (s *Session) notify(r WaitResult) {
 
 func (s *Session) deliver(w waiter) {
 	select {
-	case w <- WaitResult{State: StateTerminated, Reason: s.reason, Line: s.line}:
+	case w <- WaitResult{State: StateTerminated, Reason: s.reason, Line: s.line, LastPause: s.lastPauseRef()}:
 		close(w)
 	default:
 	}
 	delete(s.waiters, w)
 }
 
+func (s *Session) lastPauseRef() *Snapshot {
+	if s.lastPause == nil {
+		return nil
+	}
+	ref := *s.lastPause
+	if s.lastPause.Vars != nil {
+		ref.Vars = cloneVars(s.lastPause.Vars)
+	}
+	return &ref
+}
+
 func (s *Session) submit(apply func(*Session)) {
+	s.submitMu.Lock()
+	if s.closing {
+		s.submitMu.Unlock()
+		// The loop is gone or leaving. Serialize late answers so they still
+		// observe a coherent terminal state and never park on cmds.
+		<-s.done
+		s.terminalMu.Lock()
+		apply(s)
+		s.terminalMu.Unlock()
+		return
+	}
+	s.inflight.Add(1)
+	s.submitMu.Unlock()
 	select {
 	case s.cmds <- command{apply: apply}:
 	case <-s.done:
-		// The event loop drains queued work on the terminal event and then
-		// exits. Answer late callers directly instead of parking forever.
 		apply(s)
 	}
+	s.inflight.Done()
 }
 
 // Wait blocks until the next stop or termination. All waiters are released on
@@ -224,6 +292,9 @@ func (s *Session) Snapshot() Snapshot {
 				State: s.state, Reason: s.reason, PauseID: s.pauseID,
 				Line: s.line, PC: s.pc, Vars: cloneVars(s.vars),
 			}
+		}
+		if s.state == StateTerminated {
+			snapshot.LastPause = s.lastPauseRef()
 		}
 		result <- snapshot
 	})
@@ -364,10 +435,19 @@ func (s *Session) Variables(pauseID int, names []string) (map[string]int64, erro
 	}
 }
 
-// Shutdown terminates a paused executor and waits for the event loop to drain.
+// Shutdown terminates a paused executor and waits for the event loop to drain
+// every request that was admitted before the teardown started.
 func (s *Session) Shutdown() {
-	s.submit(func(s *Session) {
-		s.engine.Shutdown()
+	s.closeOnce.Do(func() {
+		s.submitMu.Lock()
+		if s.closing {
+			s.submitMu.Unlock()
+			return
+		}
+		s.inflight.Add(1)
+		s.submitMu.Unlock()
+		s.cmds <- command{closer: true}
+		s.inflight.Done()
 	})
 	s.wg.Wait()
 }

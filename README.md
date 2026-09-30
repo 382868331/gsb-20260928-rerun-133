@@ -33,6 +33,8 @@ UNIX_SOCKET=/tmp/debugd.sock BASE_URL=http://debug ./scripts/debug-client.sh
 - 每个暂停有独立 `pauseId`；旧暂停的继续或读变量不能操作新暂停。
 - 重复继续在运行中返回 `409 Conflict`，终止后返回 `410 Gone`。
 - 断点修改先更新会话权威集合，再由执行器在指令边界读取。
+- 执行器退出（含异常）不会销毁会话事件循环：退出前已入队与退出后新到达的请求都会得到明确结果（终止快照或 `410 Gone`），不会留在无人消费的队列里；只有服务端关闭会话时才回收循环，且会等所有已受理请求处理完。
+- 终止快照通过 `reason` 返回终止原因（如 `exception`/`exit`），通过 `lastPause` 返回最后一次暂停（含 `pauseId`、位置与变量）；旧 `pauseId` 始终不能读取新暂停或终止后的状态。
 - 虚拟程序 `raise` 会异常终止并返回 `reason=exception`，用于验证所有等待都被结束。
 
 ## 测试
