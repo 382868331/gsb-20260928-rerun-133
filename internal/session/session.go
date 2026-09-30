@@ -30,6 +30,12 @@ type Snapshot struct {
 	Line    int              `json:"line,omitempty"`
 	PC      int              `json:"pc,omitempty"`
 	Vars    map[string]int64 `json:"vars,omitempty"`
+
+	// LastPauseID/LastLine/LastPC describe the most recent pause reached
+	// before termination, so callers can query where the program last rested.
+	LastPauseID int `json:"lastPauseId,omitempty"`
+	LastLine    int `json:"lastLine,omitempty"`
+	LastPC      int `json:"lastPc,omitempty"`
 }
 
 type WaitResult = Snapshot
@@ -47,12 +53,19 @@ type Engine interface {
 type waiter chan WaitResult
 
 type command struct {
-	apply func(*Session)
+	apply    func(*Session)
+	shutdown bool
 }
 
 // Session serializes every request in one event loop. Continue and variable
 // reads issued concurrently therefore observe one transition each; they never
 // interleave into a mixed snapshot.
+//
+// After the executor terminates the loop keeps running and keeps answering
+// requests with explicit terminal results. It only exits after Shutdown, at
+// which point it waits for every in-flight submission to be processed. The
+// shutdown handshake guarantees no request is ever stranded on the command
+// queue waiting for a consumer that has gone away.
 type Session struct {
 	id     string
 	engine Engine
@@ -64,20 +77,39 @@ type Session struct {
 	readyDone  bool
 	wg         sync.WaitGroup
 	waiters    map[waiter]struct{}
-	state      State
-	reason     string
-	pc         int
-	line       int
-	vars       map[string]int64
-	pauseID    int
-	breakpoint map[int]bool
+
+	state       State
+	reason      string
+	pc          int
+	line        int
+	vars        map[string]int64
+	pauseID     int
+	lastPauseID int
+	lastLine    int
+	lastPC      int
+	breakpoint  map[int]bool
+
+	// stateMu guards every session field above. The event loop holds it while
+	// applying an event or command; a submitter that races the loop's exit
+	// takes the lock and applies its request directly, always on serialized
+	// state.
+	stateMu sync.Mutex
+
+	// submitGate/inFlight/closed implement the shutdown handshake. A
+	// submitter registers itself (inFlight) before sending on cmds and
+	// deregisters once its command is consumed. The loop only exits once it
+	// has observed closed with inFlight == 0, so a parked sender can never
+	// outlive the consumer.
+	submitGate sync.Mutex
+	inFlight   int
+	closed     bool
 }
 
 func New(id string, engine Engine) *Session {
 	s := &Session{
 		id:         id,
 		engine:     engine,
-		cmds:       make(chan command, 32),
+		cmds:       make(chan command),
 		done:       make(chan struct{}),
 		terminated: make(chan struct{}),
 		waiters:    map[waiter]struct{}{},
@@ -100,38 +132,69 @@ func (s *Session) loop(events <-chan executor.Event) {
 		close(s.done)
 		s.wg.Done()
 	}()
+
+	shuttingDown := false
 	for {
 		select {
 		case event := <-events:
+			s.stateMu.Lock()
 			s.onEvent(event)
-			if s.state == StateTerminated {
-				s.drainCommands()
-				return
-			}
-			continue
-		default:
-		}
-		select {
-		case event := <-events:
-			s.onEvent(event)
-			if s.state == StateTerminated {
-				s.drainCommands()
-				return
-			}
+			s.stateMu.Unlock()
 		case cmd := <-s.cmds:
+			s.deregisterInFlight()
+			s.stateMu.Lock()
 			cmd.apply(s)
+			s.stateMu.Unlock()
+			if cmd.shutdown {
+				shuttingDown = true
+			}
+			if shuttingDown && s.quiescent() {
+				return
+			}
 		}
 	}
 }
 
-func (s *Session) drainCommands() {
-	for {
-		select {
-		case cmd := <-s.cmds:
-			cmd.apply(s)
-		default:
-			return
-		}
+// quiescent reports whether the loop may exit. Every command-channel send is
+// matched by an inFlight registration made before the send, so once closed is
+// set and inFlight drains to zero no command can still be parked unconsumed.
+func (s *Session) quiescent() bool {
+	s.submitGate.Lock()
+	defer s.submitGate.Unlock()
+	return s.closed && s.inFlight == 0
+}
+
+func (s *Session) deregisterInFlight() {
+	s.submitGate.Lock()
+	s.inFlight--
+	s.submitGate.Unlock()
+}
+
+// submit runs apply on the serialized session state. Requests already queued
+// before executor exit and requests arriving after exit are all answered: the
+// loop keeps serving terminal state, and a request that loses the race with
+// loop shutdown applies directly under stateMu instead of parking forever.
+func (s *Session) submit(apply func(*Session)) {
+	s.submitGate.Lock()
+	if s.closed {
+		s.submitGate.Unlock()
+		s.stateMu.Lock()
+		apply(s)
+		s.stateMu.Unlock()
+		return
+	}
+	s.inFlight++
+	s.submitGate.Unlock()
+
+	select {
+	case s.cmds <- command{apply: apply}:
+	case <-s.done:
+		s.submitGate.Lock()
+		s.inFlight--
+		s.submitGate.Unlock()
+		s.stateMu.Lock()
+		apply(s)
+		s.stateMu.Unlock()
 	}
 }
 
@@ -144,7 +207,10 @@ func (s *Session) onEvent(event executor.Event) {
 		s.line = event.Line
 		s.vars = cloneVars(event.Vars)
 		s.pauseID = event.PauseID
-		s.notify(Snapshot{
+		s.lastPauseID = event.PauseID
+		s.lastLine = event.Line
+		s.lastPC = event.PC
+		s.notifyWaiters(Snapshot{
 			State: StateStopped, Reason: event.Reason, PauseID: s.pauseID,
 			Line: event.Line, PC: event.PC, Vars: cloneVars(event.Vars),
 		})
@@ -155,10 +221,7 @@ func (s *Session) onEvent(event executor.Event) {
 		s.line = event.Line
 		s.vars = event.Vars
 		s.pauseID = 0
-		s.notify(WaitResult{State: StateTerminated, Reason: event.Reason, Line: event.Line})
-		for w := range s.waiters {
-			s.deliver(w)
-		}
+		s.notifyWaiters(s.terminalSnapshot())
 		close(s.terminated)
 	}
 	if !s.readyDone {
@@ -167,7 +230,21 @@ func (s *Session) onEvent(event executor.Event) {
 	}
 }
 
-func (s *Session) notify(r WaitResult) {
+func (s *Session) terminalSnapshot() WaitResult {
+	return WaitResult{
+		State:       StateTerminated,
+		Reason:      s.reason,
+		Line:        s.line,
+		PC:          s.pc,
+		LastPauseID: s.lastPauseID,
+		LastLine:    s.lastLine,
+		LastPC:      s.lastPC,
+	}
+}
+
+// notifyWaiters releases every outstanding waiter with the same result and
+// removes it from the set.
+func (s *Session) notifyWaiters(r WaitResult) {
 	for w := range s.waiters {
 		w <- r
 		close(w)
@@ -175,43 +252,25 @@ func (s *Session) notify(r WaitResult) {
 	}
 }
 
-func (s *Session) deliver(w waiter) {
-	select {
-	case w <- WaitResult{State: StateTerminated, Reason: s.reason, Line: s.line}:
-		close(w)
-	default:
-	}
-	delete(s.waiters, w)
-}
-
-func (s *Session) submit(apply func(*Session)) {
-	select {
-	case s.cmds <- command{apply: apply}:
-	case <-s.done:
-		// The event loop drains queued work on the terminal event and then
-		// exits. Answer late callers directly instead of parking forever.
-		apply(s)
-	}
-}
-
 // Wait blocks until the next stop or termination. All waiters are released on
 // executor exit, including abnormal exits.
 func (s *Session) Wait() WaitResult {
 	w := make(waiter, 1)
-	result := make(chan WaitResult, 1)
 	s.submit(func(s *Session) {
 		if s.state == StateTerminated {
-			s.deliver(w)
-		} else {
-			s.waiters[w] = struct{}{}
+			r := s.terminalSnapshot()
+			w <- r
+			close(w)
+			return
 		}
+		s.waiters[w] = struct{}{}
 	})
-	go func() { result <- <-w }()
-	return <-result
+	return <-w
 }
 
 // Snapshot returns the current state. Variables are only included for a live
-// pause matching pauseId.
+// pause. A terminated snapshot additionally reports the termination reason
+// and the last pause location.
 func (s *Session) Snapshot() Snapshot {
 	result := make(chan Snapshot, 1)
 	s.submit(func(s *Session) {
@@ -219,11 +278,16 @@ func (s *Session) Snapshot() Snapshot {
 			State: s.state, Reason: s.reason, PauseID: s.pauseID,
 			Line: s.line, PC: s.pc,
 		}
-		if s.state == StateStopped {
-			snapshot = Snapshot{
-				State: s.state, Reason: s.reason, PauseID: s.pauseID,
-				Line: s.line, PC: s.pc, Vars: cloneVars(s.vars),
-			}
+		switch s.state {
+		case StateStopped:
+			snapshot.Vars = cloneVars(s.vars)
+			snapshot.LastPauseID = s.pauseID
+			snapshot.LastLine = s.line
+			snapshot.LastPC = s.pc
+		case StateTerminated:
+			snapshot.LastPauseID = s.lastPauseID
+			snapshot.LastLine = s.lastLine
+			snapshot.LastPC = s.lastPC
 		}
 		result <- snapshot
 	})
@@ -263,8 +327,6 @@ func (s *Session) Continue(pauseID int) (ContinueResult, error) {
 			return ContinueResult{Terminated: true, Reason: r.Reason}, nil
 		}
 		return ContinueResult{Paused: &r}, nil
-	case <-s.terminated:
-		return ContinueResult{}, ErrTerminated
 	}
 }
 
@@ -349,7 +411,6 @@ func (s *Session) Variables(pauseID int, names []string) (map[string]int64, erro
 				for _, name := range names {
 					if value, ok := s.vars[name]; ok {
 						out[name] = value
-
 					}
 				}
 			}
@@ -364,11 +425,36 @@ func (s *Session) Variables(pauseID int, names []string) (map[string]int64, erro
 	}
 }
 
-// Shutdown terminates a paused executor and waits for the event loop to drain.
+// Shutdown asks a still-alive executor to terminate, then blocks until every
+// submitted request has been answered and the event loop has exited. Requests
+// that finish during shutdown are still served; only after the handshake
+// observes quiescence do late callers receive their terminal result directly.
 func (s *Session) Shutdown() {
-	s.submit(func(s *Session) {
-		s.engine.Shutdown()
-	})
+	s.submitGate.Lock()
+	if s.closed {
+		s.submitGate.Unlock()
+		s.wg.Wait()
+		return
+	}
+	s.closed = true
+	s.inFlight++
+	s.submitGate.Unlock()
+
+	shutdownCmd := command{
+		shutdown: true,
+		apply: func(s *Session) {
+			if s.state != StateTerminated {
+				s.engine.Shutdown()
+			}
+		},
+	}
+	select {
+	case s.cmds <- shutdownCmd:
+	case <-s.done:
+		s.submitGate.Lock()
+		s.inFlight--
+		s.submitGate.Unlock()
+	}
 	s.wg.Wait()
 }
 
