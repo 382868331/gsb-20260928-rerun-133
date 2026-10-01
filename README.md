@@ -21,16 +21,20 @@ UNIX_SOCKET=/tmp/debugd.sock BASE_URL=http://debug ./scripts/debug-client.sh
 - `GET /programs`：列出虚拟程序。
 - `POST /sessions`：`{"program":"loop|count|raise","breakpoints":[2]}`，创建后停在入口暂停。
 - `GET /sessions/{id}`：读取当前快照。
+- `POST /sessions/{id}/attach`：`{"clientId":"alice","role":"controller","takeover":false}`，登记客户端并分配角色，返回当前权威快照；断线重连用同一 `clientId` 重新 attach 即可取回暂停或结束状态。
+- `POST /sessions/{id}/detach`：`{"clientId":"alice"`}，释放该客户端持有的控制权，程序保持当前暂停不动。
 - `POST /sessions/{id}/wait`：等待下一次暂停或终止；执行器退出会释放全部等待。
-- `POST /sessions/{id}/continue`：`{"pauseId":1}`，只允许操作当前暂停。
-- `POST /sessions/{id}/pause`：运行中请求下一条指令边界暂停。
-- `POST /sessions/{id}/breakpoints`：`{"lines":[2]}`，替换完整断点集，在安全位置生效。
+- `POST /sessions/{id}/continue`：`{"pauseId":1,"clientId":"alice","requestId":"r1"}`，只允许操作当前暂停。
+- `POST /sessions/{id}/pause`：`{"clientId":"alice","requestId":"r2"}`，运行中请求下一条指令边界暂停。
+- `POST /sessions/{id}/breakpoints`：`{"lines":[2],"clientId":"alice","requestId":"r3"}`，替换完整断点集，在安全位置生效。
 - `POST /sessions/{id}/variables`：`{"pauseId":1,"names":["i"]}`，只读取指定暂停的一致快照。
 
 ## 并发语义
 
 - 会话请求在单事件循环中串行化，继续执行与读取变量不会拼成混合快照。
 - 每个暂停有独立 `pauseId`；旧暂停的继续或读变量不能操作新暂停。
+- 控制权唯一：第一个请求控制权的客户端成为 controller，其余为只读 observer；observer 可以查询快照、等待与变量，但 continue/pause/breakpoints 返回 `403`。controller detach 后控制权重置，新客户端可接管；`takeover:true` 可显式从失联 controller 手中夺取控制权。
+- 推进类请求支持 `requestId` 幂等：重连后的重复请求返回已存结果并带 `duplicate:true`，不会再次推进程序；进行中的重复请求返回 `409` 表示已在处理。
 - 重复继续在运行中返回 `409 Conflict`，终止后返回 `410 Gone`。
 - 断点修改先更新会话权威集合，再由执行器在指令边界读取。
 - 执行器退出（含异常）不会销毁会话事件循环：退出前已入队与退出后新到达的请求都会得到明确结果（终止快照或 `410 Gone`），不会留在无人消费的队列里；只有服务端关闭会话时才回收循环，且会等所有已受理请求处理完。

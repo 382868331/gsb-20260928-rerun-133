@@ -12,6 +12,13 @@ var (
 	ErrTerminated    = errors.New("session is terminated")
 	ErrPauseMismatch = errors.New("pause id does not match the current pause")
 	ErrInvalidPause  = errors.New("pause id is required")
+	ErrNotController = errors.New("another client holds control of this session")
+	ErrUnknownClient = errors.New("client id is required")
+)
+
+const (
+	RoleController = "controller"
+	RoleObserver   = "observer"
 )
 
 type State string
@@ -24,13 +31,14 @@ const (
 
 // Snapshot is an immutable view emitted for one state transition.
 type Snapshot struct {
-	State     State            `json:"state"`
-	Reason    string           `json:"reason,omitempty"`
-	PauseID   int              `json:"pauseId,omitempty"`
-	Line      int              `json:"line,omitempty"`
-	PC        int              `json:"pc,omitempty"`
-	Vars      map[string]int64 `json:"vars,omitempty"`
-	LastPause *Snapshot        `json:"lastPause,omitempty"`
+	State      State            `json:"state"`
+	Reason     string           `json:"reason,omitempty"`
+	PauseID    int              `json:"pauseId,omitempty"`
+	Line       int              `json:"line,omitempty"`
+	PC         int              `json:"pc,omitempty"`
+	Vars       map[string]int64 `json:"vars,omitempty"`
+	LastPause  *Snapshot        `json:"lastPause,omitempty"`
+	Controller string           `json:"controller,omitempty"`
 }
 
 type WaitResult = Snapshot
@@ -39,6 +47,17 @@ type ContinueResult struct {
 	Paused     *Snapshot `json:"paused,omitempty"`
 	Terminated bool      `json:"terminated,omitempty"`
 	Reason     string    `json:"reason,omitempty"`
+	Duplicate  bool      `json:"duplicate,omitempty"`
+}
+
+// AttachResult reports the role a client received and the authoritative
+// snapshot at attach time, so a reconnecting client immediately observes the
+// current pause or the trusted termination state.
+type AttachResult struct {
+	ClientID   string   `json:"clientId"`
+	Role       string   `json:"role"`
+	Controller string   `json:"controller,omitempty"`
+	Snapshot   Snapshot `json:"snapshot"`
 }
 
 type Engine interface {
@@ -83,6 +102,19 @@ type Session struct {
 	pauseID    int
 	lastPause  *Snapshot
 	breakpoint map[int]bool
+	// controller is the client that owns execution advancement. Observers
+	// may read state but cannot resume, pause, or move breakpoints.
+	controller string
+	// completed stores the outcome of idempotent requests by request id so
+	// a reconnect-triggered retry is explained instead of re-executed.
+	completed map[string]requestOutcome
+}
+
+type requestOutcome struct {
+	continueResult *ContinueResult
+	pauseResult    *WaitResult
+	breakpoints    map[string]any
+	err            error
 }
 
 func New(id string, engine Engine) *Session {
@@ -95,6 +127,7 @@ func New(id string, engine Engine) *Session {
 		waiters:    map[waiter]struct{}{},
 		state:      StateRunning,
 		breakpoint: map[int]bool{},
+		completed:  map[string]requestOutcome{},
 	}
 	events := make(chan executor.Event, 8)
 	s.readyWG.Add(1)
@@ -278,96 +311,248 @@ func (s *Session) Wait() WaitResult {
 	return <-result
 }
 
+// snapshotLocked builds the authoritative view from inside the event loop.
+func (s *Session) snapshotLocked() Snapshot {
+	snapshot := Snapshot{
+		State: s.state, Reason: s.reason, PauseID: s.pauseID,
+		Line: s.line, PC: s.pc, Controller: s.controller,
+	}
+	if s.state == StateStopped {
+		snapshot.Vars = cloneVars(s.vars)
+	}
+	if s.state == StateTerminated {
+		snapshot.LastPause = s.lastPauseRef()
+	}
+	return snapshot
+}
+
 // Snapshot returns the current state. Variables are only included for a live
 // pause matching pauseId.
 func (s *Session) Snapshot() Snapshot {
 	result := make(chan Snapshot, 1)
 	s.submit(func(s *Session) {
-		snapshot := Snapshot{
-			State: s.state, Reason: s.reason, PauseID: s.pauseID,
-			Line: s.line, PC: s.pc,
-		}
-		if s.state == StateStopped {
-			snapshot = Snapshot{
-				State: s.state, Reason: s.reason, PauseID: s.pauseID,
-				Line: s.line, PC: s.pc, Vars: cloneVars(s.vars),
-			}
-		}
-		if s.state == StateTerminated {
-			snapshot.LastPause = s.lastPauseRef()
-		}
-		result <- snapshot
+		result <- s.snapshotLocked()
 	})
 	return <-result
 }
 
-// Continue resumes only the pause identified by pauseId. A duplicate continue
-// or a request from the previous pause cannot operate the new pause.
+// Attach registers a client with the session and resolves its role. The
+// first client asking for control becomes the controller; everyone else is a
+// read-only observer. A reconnecting client reattaches with the same id and
+// immediately receives the authoritative snapshot, including the trusted
+// termination reason and last pause after the program has exited. takeover
+// lets a new client claim control from a controller that went away.
+func (s *Session) Attach(clientID string, wantController bool, takeover bool) (AttachResult, error) {
+	if clientID == "" {
+		return AttachResult{}, ErrUnknownClient
+	}
+	result := make(chan AttachResult, 1)
+	s.submit(func(s *Session) {
+		role := RoleObserver
+		switch {
+		case s.controller == clientID:
+			role = RoleController
+		case wantController && (s.controller == "" || takeover):
+			s.controller = clientID
+			role = RoleController
+		}
+		result <- AttachResult{
+			ClientID: clientID, Role: role,
+			Controller: s.controller, Snapshot: s.snapshotLocked(),
+		}
+	})
+	return <-result, nil
+}
+
+// Detach releases control held by clientID. Execution state is untouched, so
+// a paused program stays paused until a new controller takes over.
+func (s *Session) Detach(clientID string) {
+	done := make(chan struct{})
+	s.submit(func(s *Session) {
+		if s.controller == clientID {
+			s.controller = ""
+		}
+		close(done)
+	})
+	<-done
+}
+
 func (s *Session) Continue(pauseID int) (ContinueResult, error) {
+	return s.ContinueEx("", pauseID, "")
+}
+
+// ContinueEx resumes only the pause identified by pauseId, on behalf of
+// clientID. A duplicate continue or a request from the previous pause cannot
+// operate the new pause. When a controller holds the session, only that
+// client may resume. A non-empty requestID makes the call idempotent: a
+// retry after reconnect reports the stored outcome with Duplicate set
+// instead of advancing the program again.
+func (s *Session) ContinueEx(clientID string, pauseID int, requestID string) (ContinueResult, error) {
 	if pauseID == 0 {
 		return ContinueResult{}, ErrInvalidPause
 	}
-	errCh := make(chan error, 1)
+	type outcome struct {
+		result  ContinueResult
+		err     error
+		pending bool
+	}
+	outCh := make(chan outcome, 1)
 	w := make(waiter, 1)
 	s.submit(func(s *Session) {
+		if requestID != "" {
+			if stored, ok := s.completed[requestID]; ok {
+				result := ContinueResult{}
+				if stored.continueResult != nil {
+					result = *stored.continueResult
+				}
+				result.Duplicate = true
+				outCh <- outcome{result: result, err: stored.err}
+				return
+			}
+		}
+		fail := func(err error) {
+			if requestID != "" {
+				s.completed[requestID] = requestOutcome{err: err}
+			}
+			outCh <- outcome{err: err}
+		}
 		switch {
 		case s.state == StateTerminated:
-			errCh <- ErrTerminated
+			fail(ErrTerminated)
+		case s.controller != "" && clientID != s.controller:
+			fail(ErrNotController)
 		case s.state == StateRunning:
-			errCh <- ErrRunning
+			fail(ErrRunning)
 		case pauseID != s.pauseID:
-			errCh <- ErrPauseMismatch
+			fail(ErrPauseMismatch)
 		default:
+			if requestID != "" {
+				// Mark as in-flight so a retry arriving while the
+				// program runs is explained instead of re-executed.
+				s.completed[requestID] = requestOutcome{err: ErrRunning}
+			}
 			currentPauseID := s.pauseID
 			s.waiters[w] = struct{}{}
 			s.engine.UpdateBreakpoints(s.breakpoint)
 			s.state = StateRunning
 			s.pauseID = 0
 			s.engine.Resume(currentPauseID, s.breakpoint)
+			outCh <- outcome{pending: true}
 		}
 	})
+	out := <-outCh
+	if !out.pending {
+		return out.result, out.err
+	}
+	var result ContinueResult
+	var err error
 	select {
-	case err := <-errCh:
-		return ContinueResult{}, err
 	case r := <-w:
 		if r.State == StateTerminated {
-			return ContinueResult{Terminated: true, Reason: r.Reason}, nil
+			result = ContinueResult{Terminated: true, Reason: r.Reason}
+		} else {
+			result = ContinueResult{Paused: &r}
 		}
-		return ContinueResult{Paused: &r}, nil
 	case <-s.terminated:
-		return ContinueResult{}, ErrTerminated
+		err = ErrTerminated
 	}
+	if requestID != "" {
+		stored := result
+		storedErr := err
+		s.submit(func(s *Session) {
+			s.completed[requestID] = requestOutcome{continueResult: &stored, err: storedErr}
+		})
+	}
+	return result, err
 }
 
-// Pause asks a running executor to stop at the next safe point. If already
-// stopped, the caller receives the current pause rather than invalidating it.
 func (s *Session) Pause() (WaitResult, error) {
+	return s.PauseEx("", "")
+}
+
+// PauseEx asks a running executor to stop at the next safe point. If already
+// stopped, the caller receives the current pause rather than invalidating
+// it. Only the controller may request a pause; observers get
+// ErrNotController. A non-empty requestID makes the call idempotent.
+func (s *Session) PauseEx(clientID string, requestID string) (WaitResult, error) {
+	type outcome struct {
+		result  WaitResult
+		err     error
+		pending bool
+	}
+	outCh := make(chan outcome, 1)
 	w := make(waiter, 1)
-	errCh := make(chan error, 1)
 	s.submit(func(s *Session) {
+		if requestID != "" {
+			if stored, ok := s.completed[requestID]; ok {
+				result := WaitResult{}
+				if stored.pauseResult != nil {
+					result = *stored.pauseResult
+				}
+				outCh <- outcome{result: result, err: stored.err}
+				return
+			}
+		}
+		fail := func(err error) {
+			if requestID != "" {
+				s.completed[requestID] = requestOutcome{err: err}
+			}
+			outCh <- outcome{err: err}
+		}
+		if s.controller != "" && clientID != s.controller {
+			fail(ErrNotController)
+			return
+		}
 		switch s.state {
 		case StateTerminated:
-			errCh <- ErrTerminated
+			fail(ErrTerminated)
 		case StateStopped:
-			w <- WaitResult{State: StateStopped, PauseID: s.pauseID, Reason: s.reason, Line: s.line, PC: s.pc, Vars: cloneVars(s.vars)}
-			close(w)
+			result := WaitResult{State: StateStopped, PauseID: s.pauseID, Reason: s.reason, Line: s.line, PC: s.pc, Vars: cloneVars(s.vars)}
+			if requestID != "" {
+				s.completed[requestID] = requestOutcome{pauseResult: &result}
+			}
+			outCh <- outcome{result: result}
 		default:
+			if requestID != "" {
+				s.completed[requestID] = requestOutcome{err: ErrRunning}
+			}
 			s.waiters[w] = struct{}{}
 			s.engine.Pause()
+			outCh <- outcome{pending: true}
 		}
 	})
-	select {
-	case err := <-errCh:
-		return WaitResult{}, err
-	case r := <-w:
-		return r, nil
+	out := <-outCh
+	if !out.pending {
+		return out.result, out.err
 	}
+	var result WaitResult
+	var err error
+	select {
+	case r := <-w:
+		result = r
+	case <-s.terminated:
+		err = ErrTerminated
+	}
+	if requestID != "" {
+		stored := result
+		storedErr := err
+		s.submit(func(s *Session) {
+			s.completed[requestID] = requestOutcome{pauseResult: &stored, err: storedErr}
+		})
+	}
+	return result, err
 }
 
-// SetBreakpoints replaces the complete breakpoint set. While running it is
-// handed to the executor and takes effect at the next safe point; while
-// stopped it takes effect at the current safe position.
 func (s *Session) SetBreakpoints(lines []int) (map[string]any, error) {
+	return s.SetBreakpointsEx("", lines, "")
+}
+
+// SetBreakpointsEx replaces the complete breakpoint set. While running it is
+// handed to the executor and takes effect at the next safe point; while
+// stopped it takes effect at the current safe position. Only the controller
+// may change breakpoints. A non-empty requestID makes the call idempotent:
+// a retry reports the stored result instead of re-applying.
+func (s *Session) SetBreakpointsEx(clientID string, lines []int, requestID string) (map[string]any, error) {
 	next := make(map[int]bool, len(lines))
 	for _, line := range lines {
 		next[line] = true
@@ -375,8 +560,28 @@ func (s *Session) SetBreakpoints(lines []int) (map[string]any, error) {
 	result := make(chan map[string]any, 1)
 	errCh := make(chan error, 1)
 	s.submit(func(s *Session) {
+		if requestID != "" {
+			if stored, ok := s.completed[requestID]; ok {
+				if stored.err != nil {
+					errCh <- stored.err
+				} else {
+					result <- stored.breakpoints
+				}
+				return
+			}
+		}
+		fail := func(err error) {
+			if requestID != "" {
+				s.completed[requestID] = requestOutcome{err: err}
+			}
+			errCh <- err
+		}
 		if s.state == StateTerminated {
-			errCh <- ErrTerminated
+			fail(ErrTerminated)
+			return
+		}
+		if s.controller != "" && clientID != s.controller {
+			fail(ErrNotController)
 			return
 		}
 		s.breakpoint = next
@@ -384,7 +589,11 @@ func (s *Session) SetBreakpoints(lines []int) (map[string]any, error) {
 		if s.state == StateRunning {
 			pending = s.engine.UpdateBreakpoints(next)
 		}
-		result <- map[string]any{"breakpoints": lines, "pending": pending}
+		applied := map[string]any{"breakpoints": lines, "pending": pending}
+		if requestID != "" {
+			s.completed[requestID] = requestOutcome{breakpoints: applied}
+		}
+		result <- applied
 	})
 	select {
 	case err := <-errCh:

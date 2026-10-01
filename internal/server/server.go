@@ -26,6 +26,8 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /programs", s.listPrograms)
 	mux.HandleFunc("POST /sessions", s.createSession)
 	mux.HandleFunc("GET /sessions/{id}", s.withSession(s.getSession))
+	mux.HandleFunc("POST /sessions/{id}/attach", s.withSession(s.attachSession))
+	mux.HandleFunc("POST /sessions/{id}/detach", s.withSession(s.detachSession))
 	mux.HandleFunc("POST /sessions/{id}/wait", s.withSession(s.waitSession))
 	mux.HandleFunc("POST /sessions/{id}/continue", s.withSession(s.continueSession))
 	mux.HandleFunc("POST /sessions/{id}/pause", s.withSession(s.pauseSession))
@@ -89,19 +91,17 @@ func (s *Server) getSession(w http.ResponseWriter, _ *http.Request, sess *sessio
 	writeJSON(w, http.StatusOK, sess.Snapshot())
 }
 
-func (s *Server) waitSession(w http.ResponseWriter, _ *http.Request, sess *session.Session) {
-	writeJSON(w, http.StatusOK, sess.Wait())
-}
-
-func (s *Server) continueSession(w http.ResponseWriter, r *http.Request, sess *session.Session) {
+func (s *Server) attachSession(w http.ResponseWriter, r *http.Request, sess *session.Session) {
 	var body struct {
-		PauseID int `json:"pauseId"`
+		ClientID string `json:"clientId"`
+		Role     string `json:"role"`
+		Takeover bool   `json:"takeover"`
 	}
 	if err := decodeBody(r, &body); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	result, err := sess.Continue(body.PauseID)
+	result, err := sess.Attach(body.ClientID, body.Role == session.RoleController, body.Takeover)
 	if err != nil {
 		writeSessionError(w, err)
 		return
@@ -109,8 +109,50 @@ func (s *Server) continueSession(w http.ResponseWriter, r *http.Request, sess *s
 	writeJSON(w, http.StatusOK, result)
 }
 
-func (s *Server) pauseSession(w http.ResponseWriter, _ *http.Request, sess *session.Session) {
-	result, err := sess.Pause()
+func (s *Server) detachSession(w http.ResponseWriter, r *http.Request, sess *session.Session) {
+	var body struct {
+		ClientID string `json:"clientId"`
+	}
+	if err := decodeBody(r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	sess.Detach(body.ClientID)
+	writeJSON(w, http.StatusOK, sess.Snapshot())
+}
+
+func (s *Server) waitSession(w http.ResponseWriter, _ *http.Request, sess *session.Session) {
+	writeJSON(w, http.StatusOK, sess.Wait())
+}
+
+func (s *Server) continueSession(w http.ResponseWriter, r *http.Request, sess *session.Session) {
+	var body struct {
+		PauseID   int    `json:"pauseId"`
+		ClientID  string `json:"clientId"`
+		RequestID string `json:"requestId"`
+	}
+	if err := decodeBody(r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	result, err := sess.ContinueEx(body.ClientID, body.PauseID, body.RequestID)
+	if err != nil {
+		writeSessionError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) pauseSession(w http.ResponseWriter, r *http.Request, sess *session.Session) {
+	var body struct {
+		ClientID  string `json:"clientId"`
+		RequestID string `json:"requestId"`
+	}
+	if err := decodeBody(r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	result, err := sess.PauseEx(body.ClientID, body.RequestID)
 	if err != nil {
 		writeSessionError(w, err)
 		return
@@ -120,13 +162,15 @@ func (s *Server) pauseSession(w http.ResponseWriter, _ *http.Request, sess *sess
 
 func (s *Server) setBreakpoints(w http.ResponseWriter, r *http.Request, sess *session.Session) {
 	var body struct {
-		Lines []int `json:"lines"`
+		Lines     []int  `json:"lines"`
+		ClientID  string `json:"clientId"`
+		RequestID string `json:"requestId"`
 	}
 	if err := decodeBody(r, &body); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	result, err := sess.SetBreakpoints(body.Lines)
+	result, err := sess.SetBreakpointsEx(body.ClientID, body.Lines, body.RequestID)
 	if err != nil {
 		writeSessionError(w, err)
 		return
@@ -163,6 +207,10 @@ func writeSessionError(w http.ResponseWriter, err error) bool {
 		status = http.StatusGone
 	case errors.Is(err, session.ErrPauseMismatch), errors.Is(err, session.ErrInvalidPause):
 		status = http.StatusConflict
+	case errors.Is(err, session.ErrNotController):
+		status = http.StatusForbidden
+	case errors.Is(err, session.ErrUnknownClient):
+		status = http.StatusBadRequest
 	default:
 		writeError(w, status, err)
 		return false
