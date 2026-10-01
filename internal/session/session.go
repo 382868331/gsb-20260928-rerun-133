@@ -12,6 +12,10 @@ var (
 	ErrTerminated    = errors.New("session is terminated")
 	ErrPauseMismatch = errors.New("pause id does not match the current pause")
 	ErrInvalidPause  = errors.New("pause id is required")
+	ErrUnknownClient = errors.New("unknown client token")
+	ErrNotController = errors.New("client does not hold control of the session")
+	ErrNoController  = errors.New("session has no controller; claim control first")
+	ErrControlHeld   = errors.New("control is held by another client")
 )
 
 type State string
@@ -31,6 +35,10 @@ type Snapshot struct {
 	PC        int              `json:"pc,omitempty"`
 	Vars      map[string]int64 `json:"vars,omitempty"`
 	LastPause *Snapshot        `json:"lastPause,omitempty"`
+	// Controller names the client currently holding execution control.
+	// Empty when no client has attached (legacy open mode) or control has
+	// been released and is waiting to be claimed.
+	Controller string `json:"controller,omitempty"`
 }
 
 type WaitResult = Snapshot
@@ -39,6 +47,46 @@ type ContinueResult struct {
 	Paused     *Snapshot `json:"paused,omitempty"`
 	Terminated bool      `json:"terminated,omitempty"`
 	Reason     string    `json:"reason,omitempty"`
+	// Duplicate reports that this outcome was recorded for an earlier
+	// request carrying the same requestId; the program was not advanced
+	// a second time.
+	Duplicate bool `json:"duplicate,omitempty"`
+}
+
+// PauseResult is the outcome of a pause request.
+type PauseResult struct {
+	WaitResult
+	Duplicate bool `json:"duplicate,omitempty"`
+}
+
+// Role describes how an attached client may interact with the session.
+type Role string
+
+const (
+	RoleController Role = "controller"
+	RoleObserver   Role = "observer"
+)
+
+// AttachResult is returned when a client attaches or re-attaches to a
+// session, including after a disconnect.
+type AttachResult struct {
+	Token    string   `json:"token"`
+	Role     Role     `json:"role"`
+	Snapshot Snapshot `json:"snapshot"`
+}
+
+type clientInfo struct {
+	token string
+}
+
+// storedRequest records the outcome of an idempotent request so a replay
+// (for example after a reconnect) can be explained without advancing the
+// program a second time.
+type storedRequest struct {
+	done        chan struct{}
+	continueRes ContinueResult
+	pauseRes    PauseResult
+	err         error
 }
 
 type Engine interface {
@@ -83,6 +131,17 @@ type Session struct {
 	pauseID    int
 	lastPause  *Snapshot
 	breakpoint map[int]bool
+	// clients tracks every attached client by its caller-chosen id.
+	// controller names the client id holding execution control; empty
+	// means control is released and can be claimed. When no client has
+	// ever attached the session runs in legacy open mode and mutating
+	// requests are admitted without a token.
+	clients    map[string]*clientInfo
+	controller string
+	// requests remembers recent idempotent request outcomes, keyed by
+	// requestId, so replays are answered instead of re-executed.
+	requests   map[string]*storedRequest
+	requestSeq []string
 }
 
 func New(id string, engine Engine) *Session {
@@ -95,6 +154,8 @@ func New(id string, engine Engine) *Session {
 		waiters:    map[waiter]struct{}{},
 		state:      StateRunning,
 		breakpoint: map[int]bool{},
+		clients:    map[string]*clientInfo{},
+		requests:   map[string]*storedRequest{},
 	}
 	events := make(chan executor.Event, 8)
 	s.readyWG.Add(1)
@@ -283,33 +344,98 @@ func (s *Session) Wait() WaitResult {
 func (s *Session) Snapshot() Snapshot {
 	result := make(chan Snapshot, 1)
 	s.submit(func(s *Session) {
-		snapshot := Snapshot{
-			State: s.state, Reason: s.reason, PauseID: s.pauseID,
-			Line: s.line, PC: s.pc,
-		}
-		if s.state == StateStopped {
-			snapshot = Snapshot{
-				State: s.state, Reason: s.reason, PauseID: s.pauseID,
-				Line: s.line, PC: s.pc, Vars: cloneVars(s.vars),
-			}
-		}
-		if s.state == StateTerminated {
-			snapshot.LastPause = s.lastPauseRef()
-		}
-		result <- snapshot
+		result <- s.snapshotLocked()
 	})
 	return <-result
+}
+
+// snapshotLocked builds the current snapshot. It must run inside the event
+// loop (or after teardown under terminalMu).
+func (s *Session) snapshotLocked() Snapshot {
+	snapshot := Snapshot{
+		State: s.state, Reason: s.reason, PauseID: s.pauseID,
+		Line: s.line, PC: s.pc, Controller: s.controller,
+	}
+	if s.state == StateStopped {
+		snapshot.Vars = cloneVars(s.vars)
+	}
+	if s.state == StateTerminated {
+		snapshot.LastPause = s.lastPauseRef()
+	}
+	return snapshot
+}
+
+// controlErrorLocked enforces execution-control ownership. In legacy open
+// mode (no client ever attached) every caller may advance the program. Once
+// clients attach, only the controller's token may mutate execution.
+func (s *Session) controlErrorLocked(token string) error {
+	if len(s.clients) == 0 {
+		return nil
+	}
+	if s.controller == "" {
+		return ErrNoController
+	}
+	if token == "" {
+		return ErrNotController
+	}
+	if info := s.clients[s.controller]; info != nil && info.token == token {
+		return nil
+	}
+	return ErrNotController
+}
+
+// rememberLocked stores an idempotent request outcome, evicting the oldest
+// entries past a small bound.
+func (s *Session) rememberLocked(requestID string, stored *storedRequest) {
+	const maxRemembered = 128
+	s.requests[requestID] = stored
+	s.requestSeq = append(s.requestSeq, requestID)
+	for len(s.requestSeq) > maxRemembered {
+		oldest := s.requestSeq[0]
+		s.requestSeq = s.requestSeq[1:]
+		delete(s.requests, oldest)
+	}
 }
 
 // Continue resumes only the pause identified by pauseId. A duplicate continue
 // or a request from the previous pause cannot operate the new pause.
 func (s *Session) Continue(pauseID int) (ContinueResult, error) {
+	return s.ContinueAs("", pauseID, "")
+}
+
+// ContinueAs is Continue with execution-control and idempotency semantics.
+// token must belong to the current controller once any client has attached.
+// A non-empty requestID makes the request idempotent: a replay after a
+// reconnect receives the recorded outcome with Duplicate set and never
+// advances the program again.
+func (s *Session) ContinueAs(token string, pauseID int, requestID string) (ContinueResult, error) {
 	if pauseID == 0 {
 		return ContinueResult{}, ErrInvalidPause
 	}
+	type admission struct {
+		stored *storedRequest
+		replay bool
+	}
+	admitCh := make(chan admission, 1)
 	errCh := make(chan error, 1)
 	w := make(waiter, 1)
 	s.submit(func(s *Session) {
+		if requestID != "" {
+			if stored, ok := s.requests[requestID]; ok {
+				admitCh <- admission{stored: stored, replay: true}
+				return
+			}
+		}
+		var stored *storedRequest
+		if requestID != "" {
+			stored = &storedRequest{done: make(chan struct{})}
+			s.rememberLocked(requestID, stored)
+		}
+		admitCh <- admission{stored: stored}
+		if err := s.controlErrorLocked(token); err != nil {
+			errCh <- err
+			return
+		}
 		switch {
 		case s.state == StateTerminated:
 			errCh <- ErrTerminated
@@ -326,25 +452,70 @@ func (s *Session) Continue(pauseID int) (ContinueResult, error) {
 			s.engine.Resume(currentPauseID, s.breakpoint)
 		}
 	})
+	adm := <-admitCh
+	if adm.replay {
+		stored := adm.stored
+		<-stored.done
+		result := stored.continueRes
+		result.Duplicate = true
+		return result, stored.err
+	}
+	finish := func(result ContinueResult, err error) (ContinueResult, error) {
+		if adm.stored != nil {
+			adm.stored.continueRes = result
+			adm.stored.err = err
+			close(adm.stored.done)
+		}
+		return result, err
+	}
 	select {
 	case err := <-errCh:
-		return ContinueResult{}, err
+		return finish(ContinueResult{}, err)
 	case r := <-w:
 		if r.State == StateTerminated {
-			return ContinueResult{Terminated: true, Reason: r.Reason}, nil
+			return finish(ContinueResult{Terminated: true, Reason: r.Reason}, nil)
 		}
-		return ContinueResult{Paused: &r}, nil
+		return finish(ContinueResult{Paused: &r}, nil)
 	case <-s.terminated:
-		return ContinueResult{}, ErrTerminated
+		return finish(ContinueResult{}, ErrTerminated)
 	}
 }
 
 // Pause asks a running executor to stop at the next safe point. If already
 // stopped, the caller receives the current pause rather than invalidating it.
 func (s *Session) Pause() (WaitResult, error) {
+	result, err := s.PauseAs("", "")
+	return result.WaitResult, err
+}
+
+// PauseAs is Pause with execution-control and idempotency semantics, mirroring
+// ContinueAs: token must be the controller's once clients exist, and a
+// non-empty requestID makes the request replayable without side effects.
+func (s *Session) PauseAs(token string, requestID string) (PauseResult, error) {
+	type admission struct {
+		stored *storedRequest
+		replay bool
+	}
+	admitCh := make(chan admission, 1)
 	w := make(waiter, 1)
 	errCh := make(chan error, 1)
 	s.submit(func(s *Session) {
+		if requestID != "" {
+			if stored, ok := s.requests[requestID]; ok {
+				admitCh <- admission{stored: stored, replay: true}
+				return
+			}
+		}
+		var stored *storedRequest
+		if requestID != "" {
+			stored = &storedRequest{done: make(chan struct{})}
+			s.rememberLocked(requestID, stored)
+		}
+		admitCh <- admission{stored: stored}
+		if err := s.controlErrorLocked(token); err != nil {
+			errCh <- err
+			return
+		}
 		switch s.state {
 		case StateTerminated:
 			errCh <- ErrTerminated
@@ -356,11 +527,27 @@ func (s *Session) Pause() (WaitResult, error) {
 			s.engine.Pause()
 		}
 	})
+	adm := <-admitCh
+	if adm.replay {
+		stored := adm.stored
+		<-stored.done
+		result := stored.pauseRes
+		result.Duplicate = true
+		return result, stored.err
+	}
+	finish := func(result PauseResult, err error) (PauseResult, error) {
+		if adm.stored != nil {
+			adm.stored.pauseRes = result
+			adm.stored.err = err
+			close(adm.stored.done)
+		}
+		return result, err
+	}
 	select {
 	case err := <-errCh:
-		return WaitResult{}, err
+		return finish(PauseResult{}, err)
 	case r := <-w:
-		return r, nil
+		return finish(PauseResult{WaitResult: r}, nil)
 	}
 }
 
@@ -368,6 +555,12 @@ func (s *Session) Pause() (WaitResult, error) {
 // handed to the executor and takes effect at the next safe point; while
 // stopped it takes effect at the current safe position.
 func (s *Session) SetBreakpoints(lines []int) (map[string]any, error) {
+	return s.SetBreakpointsAs("", lines)
+}
+
+// SetBreakpointsAs is SetBreakpoints guarded by execution control: once any
+// client has attached, only the controller's token may change breakpoints.
+func (s *Session) SetBreakpointsAs(token string, lines []int) (map[string]any, error) {
 	next := make(map[int]bool, len(lines))
 	for _, line := range lines {
 		next[line] = true
@@ -377,6 +570,10 @@ func (s *Session) SetBreakpoints(lines []int) (map[string]any, error) {
 	s.submit(func(s *Session) {
 		if s.state == StateTerminated {
 			errCh <- ErrTerminated
+			return
+		}
+		if err := s.controlErrorLocked(token); err != nil {
+			errCh <- err
 			return
 		}
 		s.breakpoint = next

@@ -26,6 +26,21 @@ UNIX_SOCKET=/tmp/debugd.sock BASE_URL=http://debug ./scripts/debug-client.sh
 - `POST /sessions/{id}/pause`：运行中请求下一条指令边界暂停。
 - `POST /sessions/{id}/breakpoints`：`{"lines":[2]}`，替换完整断点集，在安全位置生效。
 - `POST /sessions/{id}/variables`：`{"pauseId":1,"names":["i"]}`，只读取指定暂停的一致快照。
+- `POST /sessions/{id}/attach`：`{"client":"alice"}`，登记或重连客户端，返回 `token`、`role` 与当前快照。
+- `POST /sessions/{id}/release`：`{"token":"..."}`，控制者释放执行控制权。
+- `POST /sessions/{id}/claim`：`{"token":"..."}`，控制权空闲时由观察者接管。
+
+## 重连与控制权
+
+- 客户端以自定义 id `attach`；同一 id 重连会拿回同一 `token` 与角色，并立即获得当前暂停或终止快照（含 `reason` 与 `lastPause`）。
+- 首个 attach 的客户端成为控制者（`controller`），其余为只读观察者（`observer`）；快照中的 `controller` 字段标明当前归属。
+- 观察者可以继续查询快照、变量与等待事件；`continue`/`pause`/`breakpoints` 只能由控制者凭 `token` 执行，否则返回 `403`。
+- 控制者 `release` 后控制权悬空，推进请求返回 `409`，任何已 attach 的客户端可 `claim` 接管；控制者断开、程序退出与新客户端接管交错时，终止原因与最后暂停始终保留。
+- 未 attach 任何客户端时保持兼容的开放模式（不要求令牌）。
+
+## 幂等请求
+
+- `continue`/`pause` 接受 `requestId`：相同 `requestId` 的重发（如重连后重试）返回首次处理结果并带 `duplicate:true`，不会再次推进程序；已记录的拒绝（如旧 `pauseId`）也会以 `duplicate:true` 解释。
 
 ## 并发语义
 

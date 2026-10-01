@@ -31,6 +31,9 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /sessions/{id}/pause", s.withSession(s.pauseSession))
 	mux.HandleFunc("POST /sessions/{id}/breakpoints", s.withSession(s.setBreakpoints))
 	mux.HandleFunc("POST /sessions/{id}/variables", s.withSession(s.variables))
+	mux.HandleFunc("POST /sessions/{id}/attach", s.withSession(s.attachSession))
+	mux.HandleFunc("POST /sessions/{id}/release", s.withSession(s.releaseSession))
+	mux.HandleFunc("POST /sessions/{id}/claim", s.withSession(s.claimSession))
 	return logging(mux)
 }
 
@@ -89,30 +92,90 @@ func (s *Server) getSession(w http.ResponseWriter, _ *http.Request, sess *sessio
 	writeJSON(w, http.StatusOK, sess.Snapshot())
 }
 
+// attachSession registers (or re-registers after a disconnect) a client and
+// answers with its token, role, and a fresh snapshot so a reconnecting
+// client immediately observes the current pause or termination state.
+func (s *Server) attachSession(w http.ResponseWriter, r *http.Request, sess *session.Session) {
+	var body struct {
+		Client string `json:"client"`
+	}
+	if err := decodeBody(r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if body.Client == "" {
+		writeError(w, http.StatusBadRequest, errors.New("client id is required"))
+		return
+	}
+	writeJSON(w, http.StatusOK, sess.Attach(body.Client))
+}
+
+// releaseSession drops execution control; any attached client may then claim.
+func (s *Server) releaseSession(w http.ResponseWriter, r *http.Request, sess *session.Session) {
+	var body struct {
+		Token string `json:"token"`
+	}
+	if err := decodeBody(r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := sess.Release(body.Token); err != nil {
+		writeSessionError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"controller": ""})
+}
+
+// claimSession lets an attached observer take over vacant execution control.
+func (s *Server) claimSession(w http.ResponseWriter, r *http.Request, sess *session.Session) {
+	var body struct {
+		Token string `json:"token"`
+	}
+	if err := decodeBody(r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := sess.Claim(body.Token); err != nil {
+		writeSessionError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"role": string(session.RoleController)})
+}
+
 func (s *Server) waitSession(w http.ResponseWriter, _ *http.Request, sess *session.Session) {
 	writeJSON(w, http.StatusOK, sess.Wait())
 }
 
 func (s *Server) continueSession(w http.ResponseWriter, r *http.Request, sess *session.Session) {
 	var body struct {
-		PauseID int `json:"pauseId"`
+		PauseID   int    `json:"pauseId"`
+		Token     string `json:"token"`
+		RequestID string `json:"requestId"`
 	}
 	if err := decodeBody(r, &body); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	result, err := sess.Continue(body.PauseID)
+	result, err := sess.ContinueAs(body.Token, body.PauseID, body.RequestID)
 	if err != nil {
-		writeSessionError(w, err)
+		writeSessionErrorDuplicate(w, err, result.Duplicate)
 		return
 	}
 	writeJSON(w, http.StatusOK, result)
 }
 
-func (s *Server) pauseSession(w http.ResponseWriter, _ *http.Request, sess *session.Session) {
-	result, err := sess.Pause()
+func (s *Server) pauseSession(w http.ResponseWriter, r *http.Request, sess *session.Session) {
+	var body struct {
+		Token     string `json:"token"`
+		RequestID string `json:"requestId"`
+	}
+	if err := decodeBody(r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	result, err := sess.PauseAs(body.Token, body.RequestID)
 	if err != nil {
-		writeSessionError(w, err)
+		writeSessionErrorDuplicate(w, err, result.Duplicate)
 		return
 	}
 	writeJSON(w, http.StatusOK, result)
@@ -120,13 +183,14 @@ func (s *Server) pauseSession(w http.ResponseWriter, _ *http.Request, sess *sess
 
 func (s *Server) setBreakpoints(w http.ResponseWriter, r *http.Request, sess *session.Session) {
 	var body struct {
-		Lines []int `json:"lines"`
+		Lines []int  `json:"lines"`
+		Token string `json:"token"`
 	}
 	if err := decodeBody(r, &body); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	result, err := sess.SetBreakpoints(body.Lines)
+	result, err := sess.SetBreakpointsAs(body.Token, body.Lines)
 	if err != nil {
 		writeSessionError(w, err)
 		return
@@ -152,6 +216,13 @@ func (s *Server) variables(w http.ResponseWriter, r *http.Request, sess *session
 }
 
 func writeSessionError(w http.ResponseWriter, err error) bool {
+	return writeSessionErrorDuplicate(w, err, false)
+}
+
+// writeSessionErrorDuplicate maps session errors to statuses and annotates
+// idempotent replays so a client can tell an already-processed request from
+// a fresh rejection.
+func writeSessionErrorDuplicate(w http.ResponseWriter, err error, duplicate bool) bool {
 	if err == nil {
 		return true
 	}
@@ -163,8 +234,16 @@ func writeSessionError(w http.ResponseWriter, err error) bool {
 		status = http.StatusGone
 	case errors.Is(err, session.ErrPauseMismatch), errors.Is(err, session.ErrInvalidPause):
 		status = http.StatusConflict
+	case errors.Is(err, session.ErrNotController), errors.Is(err, session.ErrUnknownClient):
+		status = http.StatusForbidden
+	case errors.Is(err, session.ErrNoController), errors.Is(err, session.ErrControlHeld):
+		status = http.StatusConflict
 	default:
 		writeError(w, status, err)
+		return false
+	}
+	if duplicate {
+		writeJSON(w, status, map[string]any{"error": err.Error(), "duplicate": true})
 		return false
 	}
 	writeError(w, status, err)
