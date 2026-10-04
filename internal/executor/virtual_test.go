@@ -15,12 +15,18 @@ func TestBreakpointResume(t *testing.T) {
 	if entry.Reason != executor.ReasonEntry {
 		t.Fatalf("entry = %+v", entry)
 	}
-	if !v.UpdateBreakpoints(map[int]bool{2: true}) {
+	set := executor.BreakpointSet{Version: 1, Items: map[int]executor.Breakpoint{
+		2: {Line: 2, Enabled: true},
+	}}
+	if !v.UpdateBreakpoints(set) {
 		t.Fatal("update failed")
 	}
-	v.Resume(entry.PauseID, map[int]bool{2: true})
+	v.Resume(entry.PauseID, set)
 	next := <-events
 	if next.Reason != executor.ReasonBreakpoint || next.Line != 2 {
 		t.Fatalf("next = %+v", next)
+	}
+	if next.BreakpointVersion != 1 || next.Hits[2] != 1 {
+		t.Fatalf("version/hits = %+v", next)
 	}
 }

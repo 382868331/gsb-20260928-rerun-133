@@ -27,6 +27,10 @@ UNIX_SOCKET=/tmp/debugd.sock BASE_URL=http://debug ./scripts/debug-client.sh
 - `POST /sessions/{id}/continue`：`{"pauseId":1,"clientId":"alice","requestId":"r1"}`，只允许操作当前暂停。
 - `POST /sessions/{id}/pause`：`{"clientId":"alice","requestId":"r2"}`，运行中请求下一条指令边界暂停。
 - `POST /sessions/{id}/breakpoints`：`{"lines":[2],"clientId":"alice","requestId":"r3"}`，替换完整断点集，在安全位置生效。
+- `POST /sessions/{id}/breakpoints/preview`：`{"changes":[{"line":2,"enabled":true,"condition":"i >= 2","hitCount":3}],"clientId":"bob"}`，在当前采用版本之上准备可预览的候选版本；observer 也可以准备与查看。
+- `GET /sessions/{id}/breakpoints/candidate`：查看候选及其 `stale`/`recheck` 状态。
+- `POST /sessions/{id}/breakpoints/adopt`：`{"clientId":"alice","requestId":"r4"}`，仅当前控制者能把候选采用为下一个权威版本；候选过期返回 `409` 与 `recheck` 明细。
+- `POST /sessions/{id}/reload`：记录一次源码重载，使此前准备的候选过期。
 - `POST /sessions/{id}/variables`：`{"pauseId":1,"names":["i"]}`，只读取指定暂停的一致快照。
 
 ## 并发语义
@@ -37,6 +41,8 @@ UNIX_SOCKET=/tmp/debugd.sock BASE_URL=http://debug ./scripts/debug-client.sh
 - 推进类请求支持 `requestId` 幂等：重连后的重复请求返回已存结果并带 `duplicate:true`，不会再次推进程序；进行中的重复请求返回 `409` 表示已在处理。
 - 重复继续在运行中返回 `409 Conflict`，终止后返回 `410 Gone`。
 - 断点修改先更新会话权威集合，再由执行器在指令边界读取。
+- 断点按版本管理：每次采用生成递增 `breakpointVersion`，快照与每次暂停都记录实际生效的版本；候选绑定准备时的暂停、源码版本与基准版本，任一变化都会标出 `recheck`（需要重新核对的位置与期间累积的命中记录），不会静默套用旧决定；旧控制者在控制权交接后的迟到采用返回 `403`，不改变当前版本。
+- 断点条件出错（未知变量、非法表达式）时仍然暂停并随快照返回 `diagnostic`，不会当作未命中；`hitCount` 为命中次数约定（命中数达到其倍数才停），`hits` 记录自启动以来每行累计命中，重开后已发生的命中与尚未采用的候选修改始终可区分。
 - 执行器退出（含异常）不会销毁会话事件循环：退出前已入队与退出后新到达的请求都会得到明确结果（终止快照或 `410 Gone`），不会留在无人消费的队列里；只有服务端关闭会话时才回收循环，且会等所有已受理请求处理完。
 - 终止快照通过 `reason` 返回终止原因（如 `exception`/`exit`），通过 `lastPause` 返回最后一次暂停（含 `pauseId`、位置与变量）；旧 `pauseId` 始终不能读取新暂停或终止后的状态。
 - 虚拟程序 `raise` 会异常终止并返回 `reason=exception`，用于验证所有等待都被结束。

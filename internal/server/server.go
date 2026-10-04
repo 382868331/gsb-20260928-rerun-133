@@ -32,6 +32,10 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /sessions/{id}/continue", s.withSession(s.continueSession))
 	mux.HandleFunc("POST /sessions/{id}/pause", s.withSession(s.pauseSession))
 	mux.HandleFunc("POST /sessions/{id}/breakpoints", s.withSession(s.setBreakpoints))
+	mux.HandleFunc("POST /sessions/{id}/breakpoints/preview", s.withSession(s.previewBreakpoints))
+	mux.HandleFunc("GET /sessions/{id}/breakpoints/candidate", s.withSession(s.getCandidate))
+	mux.HandleFunc("POST /sessions/{id}/breakpoints/adopt", s.withSession(s.adoptCandidate))
+	mux.HandleFunc("POST /sessions/{id}/reload", s.withSession(s.reloadSource))
 	mux.HandleFunc("POST /sessions/{id}/variables", s.withSession(s.variables))
 	return logging(mux)
 }
@@ -195,6 +199,62 @@ func (s *Server) variables(w http.ResponseWriter, r *http.Request, sess *session
 	writeJSON(w, http.StatusOK, map[string]any{"vars": result})
 }
 
+func (s *Server) previewBreakpoints(w http.ResponseWriter, r *http.Request, sess *session.Session) {
+	var body struct {
+		Changes  []executor.Breakpoint `json:"changes"`
+		ClientID string                `json:"clientId"`
+	}
+	if err := decodeBody(r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	view, err := sess.PreviewBreakpoints(body.ClientID, body.Changes)
+	if err != nil {
+		writeSessionError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, view)
+}
+
+func (s *Server) getCandidate(w http.ResponseWriter, _ *http.Request, sess *session.Session) {
+	view, err := sess.Candidate()
+	if err != nil {
+		writeSessionError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, view)
+}
+
+func (s *Server) adoptCandidate(w http.ResponseWriter, r *http.Request, sess *session.Session) {
+	var body struct {
+		ClientID  string `json:"clientId"`
+		RequestID string `json:"requestId"`
+	}
+	if err := decodeBody(r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	result, recheck, err := sess.AdoptCandidate(body.ClientID, body.RequestID)
+	if err != nil {
+		if errors.Is(err, session.ErrStaleCandidate) {
+			writeJSON(w, http.StatusConflict, map[string]any{"error": err.Error(), "recheck": recheck})
+			return
+		}
+		writeSessionError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) reloadSource(w http.ResponseWriter, _ *http.Request, sess *session.Session) {
+	version, err := sess.NoteSourceChange()
+	if err != nil {
+		writeSessionError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"sourceVersion": version})
+}
+
 func writeSessionError(w http.ResponseWriter, err error) bool {
 	if err == nil {
 		return true
@@ -211,6 +271,8 @@ func writeSessionError(w http.ResponseWriter, err error) bool {
 		status = http.StatusForbidden
 	case errors.Is(err, session.ErrUnknownClient):
 		status = http.StatusBadRequest
+	case errors.Is(err, session.ErrNoCandidate):
+		status = http.StatusConflict
 	default:
 		writeError(w, status, err)
 		return false

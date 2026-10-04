@@ -2,6 +2,7 @@ package session
 
 import (
 	"errors"
+	"sort"
 	"sync"
 
 	"debugservice/internal/executor"
@@ -14,6 +15,10 @@ var (
 	ErrInvalidPause  = errors.New("pause id is required")
 	ErrNotController = errors.New("another client holds control of this session")
 	ErrUnknownClient = errors.New("client id is required")
+	// ErrStaleCandidate rejects adopting a candidate whose pause, source, or
+	// base version moved on; the caller must re-verify locations and hits.
+	ErrStaleCandidate = errors.New("candidate is stale: re-verify locations and hit records")
+	ErrNoCandidate    = errors.New("no breakpoint candidate is prepared")
 )
 
 const (
@@ -39,6 +44,47 @@ type Snapshot struct {
 	Vars       map[string]int64 `json:"vars,omitempty"`
 	LastPause  *Snapshot        `json:"lastPause,omitempty"`
 	Controller string           `json:"controller,omitempty"`
+	// BreakpointVersion is the adopted breakpoint version in effect: the
+	// version a pause actually used, or the latest adopted version while
+	// running.
+	BreakpointVersion int `json:"breakpointVersion,omitempty"`
+	// Hits are cumulative breakpoint hit counts per line since start, so
+	// after a resume already-occurred hits stay distinguishable from
+	// candidate edits that are not adopted yet.
+	Hits map[int]int `json:"hits,omitempty"`
+	// Diagnostic explains a condition evaluation error at this pause.
+	Diagnostic string `json:"diagnostic,omitempty"`
+	// SourceVersion increments on every source reload; candidates prepared
+	// against an older source version are stale.
+	SourceVersion int `json:"sourceVersion,omitempty"`
+}
+
+// Candidate is a previewable, not-yet-adopted breakpoint version. Any
+// client may prepare or inspect it; only the controller may adopt it.
+type Candidate struct {
+	ID                int                         `json:"id"`
+	BaseVersion       int                         `json:"baseVersion"`
+	BasePauseSeq      int                         `json:"-"`
+	BaseSourceVersion int                         `json:"-"`
+	BaseHits          map[int]int                 `json:"-"`
+	Items             map[int]executor.Breakpoint `json:"items"`
+	PreparedBy        string                      `json:"preparedBy,omitempty"`
+}
+
+// RecheckInfo lists what must be re-verified before a stale candidate can
+// be adopted again: the candidate locations and the hit records that
+// accumulated since the candidate was prepared.
+type RecheckInfo struct {
+	Reason string      `json:"reason"`
+	Lines  []int       `json:"lines"`
+	Hits   map[int]int `json:"hits,omitempty"`
+}
+
+// CandidateView is the read model observers and controllers both see.
+type CandidateView struct {
+	Candidate Candidate    `json:"candidate"`
+	Stale     bool         `json:"stale"`
+	Recheck   *RecheckInfo `json:"recheck,omitempty"`
 }
 
 type WaitResult = Snapshot
@@ -100,8 +146,18 @@ type Session struct {
 	line       int
 	vars       map[string]int64
 	pauseID    int
+	pauseSeq   int
 	lastPause  *Snapshot
-	breakpoint map[int]bool
+	// breakpoints are the currently adopted version; candidate holds a
+	// previewable next version that only the controller may adopt.
+	breakpoints   map[int]executor.Breakpoint
+	bpVersion     int
+	pauseVersion  int
+	hits          map[int]int
+	diagnostic    string
+	sourceVersion int
+	candidate     *Candidate
+	candidateSeq  int
 	// controller is the client that owns execution advancement. Observers
 	// may read state but cannot resume, pause, or move breakpoints.
 	controller string
@@ -114,20 +170,23 @@ type requestOutcome struct {
 	continueResult *ContinueResult
 	pauseResult    *WaitResult
 	breakpoints    map[string]any
+	adopt          map[string]any
+	recheck        *RecheckInfo
 	err            error
 }
 
 func New(id string, engine Engine) *Session {
 	s := &Session{
-		id:         id,
-		engine:     engine,
-		cmds:       make(chan command, 32),
-		done:       make(chan struct{}),
-		terminated: make(chan struct{}),
-		waiters:    map[waiter]struct{}{},
-		state:      StateRunning,
-		breakpoint: map[int]bool{},
-		completed:  map[string]requestOutcome{},
+		id:          id,
+		engine:      engine,
+		cmds:        make(chan command, 32),
+		done:        make(chan struct{}),
+		terminated:  make(chan struct{}),
+		waiters:     map[waiter]struct{}{},
+		state:       StateRunning,
+		breakpoints: map[int]executor.Breakpoint{},
+		hits:        map[int]int{},
+		completed:   map[string]requestOutcome{},
 	}
 	events := make(chan executor.Event, 8)
 	s.readyWG.Add(1)
@@ -217,14 +276,22 @@ func (s *Session) onEvent(event executor.Event) {
 		s.line = event.Line
 		s.vars = cloneVars(event.Vars)
 		s.pauseID = event.PauseID
+		s.pauseSeq++
+		s.pauseVersion = event.BreakpointVersion
+		s.diagnostic = event.Diagnostic
+		if event.Hits != nil {
+			s.hits = cloneHits(event.Hits)
+		}
 		s.lastPause = &Snapshot{
 			State: StateStopped, Reason: event.Reason, PauseID: event.PauseID,
 			Line: event.Line, PC: event.PC, Vars: cloneVars(event.Vars),
+			BreakpointVersion: event.BreakpointVersion, Diagnostic: event.Diagnostic,
 		}
 		s.notify(Snapshot{
 			State: StateStopped, Reason: event.Reason, PauseID: s.pauseID,
 			Line: event.Line, PC: event.PC, Vars: cloneVars(event.Vars),
-			LastPause: s.lastPauseRef(),
+			LastPause: s.lastPauseRef(), BreakpointVersion: event.BreakpointVersion,
+			Diagnostic: event.Diagnostic, Hits: cloneHits(s.hits),
 		})
 	case executor.EventTerminated:
 		s.state = StateTerminated
@@ -316,9 +383,14 @@ func (s *Session) snapshotLocked() Snapshot {
 	snapshot := Snapshot{
 		State: s.state, Reason: s.reason, PauseID: s.pauseID,
 		Line: s.line, PC: s.pc, Controller: s.controller,
+		SourceVersion: s.sourceVersion, Hits: cloneHits(s.hits),
 	}
 	if s.state == StateStopped {
 		snapshot.Vars = cloneVars(s.vars)
+		snapshot.BreakpointVersion = s.pauseVersion
+		snapshot.Diagnostic = s.diagnostic
+	} else {
+		snapshot.BreakpointVersion = s.bpVersion
 	}
 	if s.state == StateTerminated {
 		snapshot.LastPause = s.lastPauseRef()
@@ -433,10 +505,11 @@ func (s *Session) ContinueEx(clientID string, pauseID int, requestID string) (Co
 			}
 			currentPauseID := s.pauseID
 			s.waiters[w] = struct{}{}
-			s.engine.UpdateBreakpoints(s.breakpoint)
+			set := executor.BreakpointSet{Version: s.bpVersion, Items: cloneBreakpoints(s.breakpoints)}
+			s.engine.UpdateBreakpoints(set)
 			s.state = StateRunning
 			s.pauseID = 0
-			s.engine.Resume(currentPauseID, s.breakpoint)
+			s.engine.Resume(currentPauseID, set)
 			outCh <- outcome{pending: true}
 		}
 	})
@@ -547,15 +620,16 @@ func (s *Session) SetBreakpoints(lines []int) (map[string]any, error) {
 	return s.SetBreakpointsEx("", lines, "")
 }
 
-// SetBreakpointsEx replaces the complete breakpoint set. While running it is
-// handed to the executor and takes effect at the next safe point; while
-// stopped it takes effect at the current safe position. Only the controller
-// may change breakpoints. A non-empty requestID makes the call idempotent:
-// a retry reports the stored result instead of re-applying.
+// SetBreakpointsEx replaces the complete breakpoint set with plain enabled
+// breakpoints and adopts it immediately as the next version. While running
+// it is handed to the executor and takes effect at the next safe point;
+// while stopped it takes effect at the current safe position. Only the
+// controller may change breakpoints. A non-empty requestID makes the call
+// idempotent: a retry reports the stored result instead of re-applying.
 func (s *Session) SetBreakpointsEx(clientID string, lines []int, requestID string) (map[string]any, error) {
-	next := make(map[int]bool, len(lines))
+	items := make(map[int]executor.Breakpoint, len(lines))
 	for _, line := range lines {
-		next[line] = true
+		items[line] = executor.Breakpoint{Line: line, Enabled: true}
 	}
 	result := make(chan map[string]any, 1)
 	errCh := make(chan error, 1)
@@ -584,12 +658,8 @@ func (s *Session) SetBreakpointsEx(clientID string, lines []int, requestID strin
 			fail(ErrNotController)
 			return
 		}
-		s.breakpoint = next
-		pending := false
-		if s.state == StateRunning {
-			pending = s.engine.UpdateBreakpoints(next)
-		}
-		applied := map[string]any{"breakpoints": lines, "pending": pending}
+		pending := s.adoptLocked(items)
+		applied := map[string]any{"breakpoints": lines, "pending": pending, "version": s.bpVersion}
 		if requestID != "" {
 			s.completed[requestID] = requestOutcome{breakpoints: applied}
 		}
@@ -601,6 +671,222 @@ func (s *Session) SetBreakpointsEx(clientID string, lines []int, requestID strin
 	case r := <-result:
 		return r, nil
 	}
+}
+
+// adoptLocked installs items as the next adopted version and pushes it to
+// the executor when the program is running. It reports whether the update
+// is still pending at the executor.
+func (s *Session) adoptLocked(items map[int]executor.Breakpoint) bool {
+	s.bpVersion++
+	s.breakpoints = cloneBreakpoints(items)
+	if s.state == StateRunning {
+		return s.engine.UpdateBreakpoints(executor.BreakpointSet{Version: s.bpVersion, Items: cloneBreakpoints(items)})
+	}
+	return false
+}
+
+// PreviewBreakpoints prepares a candidate version by applying changes on
+// top of the currently adopted set. Any client, including observers, may
+// prepare and inspect a candidate; adoption is restricted to the
+// controller. The candidate is bound to the pause, source version, and
+// base version at preparation time.
+func (s *Session) PreviewBreakpoints(clientID string, changes []executor.Breakpoint) (CandidateView, error) {
+	result := make(chan CandidateView, 1)
+	errCh := make(chan error, 1)
+	s.submit(func(s *Session) {
+		if s.state == StateTerminated {
+			errCh <- ErrTerminated
+			return
+		}
+		items := cloneBreakpoints(s.breakpoints)
+		for _, change := range changes {
+			items[change.Line] = change
+		}
+		s.candidateSeq++
+		s.candidate = &Candidate{
+			ID:                s.candidateSeq,
+			BaseVersion:       s.bpVersion,
+			BasePauseSeq:      s.pauseSeq,
+			BaseSourceVersion: s.sourceVersion,
+			BaseHits:          cloneHits(s.hits),
+			Items:             items,
+			PreparedBy:        clientID,
+		}
+		result <- s.candidateViewLocked()
+	})
+	select {
+	case err := <-errCh:
+		return CandidateView{}, err
+	case view := <-result:
+		return view, nil
+	}
+}
+
+// CandidateViewLocked describes the prepared candidate and, when stale,
+// exactly which locations and hit records need re-verification.
+func (s *Session) candidateViewLocked() CandidateView {
+	view := CandidateView{Candidate: *s.candidate}
+	view.Candidate.Items = cloneBreakpoints(s.candidate.Items)
+	if recheck := s.staleReasonLocked(); recheck != nil {
+		view.Stale = true
+		view.Recheck = recheck
+	}
+	return view
+}
+
+// staleReasonLocked reports why the prepared candidate no longer matches
+// the session: a newer pause, a source reload, or a newer adopted version.
+// It returns nil when the candidate is still adoptable.
+func (s *Session) staleReasonLocked() *RecheckInfo {
+	c := s.candidate
+	if c == nil {
+		return nil
+	}
+	reason := ""
+	switch {
+	case c.BaseSourceVersion != s.sourceVersion:
+		reason = "source changed since the candidate was prepared"
+	case c.BasePauseSeq != s.pauseSeq:
+		reason = "a new pause occurred since the candidate was prepared"
+	case c.BaseVersion != s.bpVersion:
+		reason = "a newer breakpoint version was adopted since the candidate was prepared"
+	default:
+		return nil
+	}
+	lines := make([]int, 0, len(c.Items))
+	for line := range c.Items {
+		lines = append(lines, line)
+	}
+	sortInts(lines)
+	hits := map[int]int{}
+	for line, count := range s.hits {
+		if count-c.BaseHits[line] > 0 {
+			hits[line] = count - c.BaseHits[line]
+		}
+	}
+	return &RecheckInfo{Reason: reason, Lines: lines, Hits: hits}
+}
+
+// Candidate returns the current candidate view, including staleness and
+// re-verification details. Observers may inspect it; only the controller
+// can adopt.
+func (s *Session) Candidate() (CandidateView, error) {
+	result := make(chan CandidateView, 1)
+	errCh := make(chan error, 1)
+	s.submit(func(s *Session) {
+		if s.candidate == nil {
+			errCh <- ErrNoCandidate
+			return
+		}
+		result <- s.candidateViewLocked()
+	})
+	select {
+	case err := <-errCh:
+		return CandidateView{}, err
+	case view := <-result:
+		return view, nil
+	}
+}
+
+// AdoptResult describes an adopted candidate version.
+type AdoptResult struct {
+	Version int                         `json:"version"`
+	Items   map[int]executor.Breakpoint `json:"items"`
+	Pending bool                        `json:"pending"`
+}
+
+// AdoptCandidate promotes the prepared candidate to the next authoritative
+// version. Only the current controller may adopt; a late adopt from a
+// controller that already handed over control fails with ErrNotController
+// and never touches the current version. A stale candidate fails with
+// ErrStaleCandidate and the re-verification details. A non-empty requestID
+// makes the call idempotent.
+func (s *Session) AdoptCandidate(clientID string, requestID string) (AdoptResult, *RecheckInfo, error) {
+	type outcome struct {
+		result  AdoptResult
+		recheck *RecheckInfo
+		err     error
+	}
+	outCh := make(chan outcome, 1)
+	s.submit(func(s *Session) {
+		if requestID != "" {
+			if stored, ok := s.completed[requestID]; ok {
+				out := outcome{err: stored.err, recheck: stored.recheck}
+				if stored.adopt != nil {
+					out.result = adoptResultFromMap(stored.adopt)
+				}
+				outCh <- out
+				return
+			}
+		}
+		fail := func(err error, recheck *RecheckInfo) {
+			if requestID != "" {
+				s.completed[requestID] = requestOutcome{err: err, recheck: recheck}
+			}
+			outCh <- outcome{err: err, recheck: recheck}
+		}
+		switch {
+		case s.state == StateTerminated:
+			fail(ErrTerminated, nil)
+		case s.controller != "" && clientID != s.controller:
+			fail(ErrNotController, nil)
+		case s.candidate == nil:
+			fail(ErrNoCandidate, nil)
+		default:
+			if recheck := s.staleReasonLocked(); recheck != nil {
+				fail(ErrStaleCandidate, recheck)
+				return
+			}
+			pending := s.adoptLocked(s.candidate.Items)
+			result := AdoptResult{Version: s.bpVersion, Items: cloneBreakpoints(s.breakpoints), Pending: pending}
+			s.candidate = nil
+			if requestID != "" {
+				s.completed[requestID] = requestOutcome{adopt: adoptResultToMap(result)}
+			}
+			outCh <- outcome{result: result}
+		}
+	})
+	out := <-outCh
+	return out.result, out.recheck, out.err
+}
+
+// NoteSourceChange records a source reload. Candidates prepared before it
+// become stale and must be re-verified; already-occurred hits are kept.
+func (s *Session) NoteSourceChange() (int, error) {
+	result := make(chan int, 1)
+	errCh := make(chan error, 1)
+	s.submit(func(s *Session) {
+		if s.state == StateTerminated {
+			errCh <- ErrTerminated
+			return
+		}
+		s.sourceVersion++
+		result <- s.sourceVersion
+	})
+	select {
+	case err := <-errCh:
+		return 0, err
+	case version := <-result:
+		return version, nil
+	}
+}
+
+func adoptResultToMap(r AdoptResult) map[string]any {
+	return map[string]any{"version": r.Version, "items": r.Items, "pending": r.Pending}
+}
+
+func adoptResultFromMap(m map[string]any) AdoptResult {
+	out := AdoptResult{}
+	if v, ok := m["version"].(int); ok {
+		out.Version = v
+	}
+	if items, ok := m["items"].(map[int]executor.Breakpoint); ok {
+		out.Items = items
+	}
+	if p, ok := m["pending"].(bool); ok {
+		out.Pending = p
+	}
+	return out
 }
 
 // Variables reads variables from exactly one pause. While running it fails
@@ -672,4 +958,27 @@ func cloneVars(in map[string]int64) map[string]int64 {
 		out[name] = value
 	}
 	return out
+}
+
+func cloneHits(in map[int]int) map[int]int {
+	if in == nil {
+		return nil
+	}
+	out := make(map[int]int, len(in))
+	for line, count := range in {
+		out[line] = count
+	}
+	return out
+}
+
+func cloneBreakpoints(in map[int]executor.Breakpoint) map[int]executor.Breakpoint {
+	out := make(map[int]executor.Breakpoint, len(in))
+	for line, bp := range in {
+		out[line] = bp
+	}
+	return out
+}
+
+func sortInts(values []int) {
+	sort.Ints(values)
 }
