@@ -320,3 +320,58 @@ func TestReconnectKeepsVersionsAndCandidates(t *testing.T) {
 		t.Fatalf("duplicate candidate staged: %+v", view.Candidates)
 	}
 }
+
+func TestHitCountCandidatePauseBasis(t *testing.T) {
+	sess := newSession(t, "loop")
+	defer sess.Close()
+	if _, err := sess.Attach("alice", true, false); err != nil {
+		t.Fatal(err)
+	}
+	entry := sess.Snapshot()
+
+	candidate, err := sess.StageCandidate("alice", []session.BreakpointSpec{
+		{Line: 2, Enabled: true, HitCount: 3},
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := sess.AdoptCandidate("alice", candidate.ID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(record.Breakpoints) != 1 || record.Breakpoints[0].HitCount != 3 {
+		t.Fatalf("adopted record = %+v, want hitCount 3", record)
+	}
+
+	result, err := sess.ContinueEx("alice", entry.PauseID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Paused == nil || result.Paused.Reason != "breakpoint" {
+		t.Fatalf("continue = %+v, want breakpoint pause", result)
+	}
+	// The pause records both the version and the hit count it fired on.
+	if result.Paused.HitCount != 3 || result.Paused.BreakpointVersion != record.ID {
+		t.Fatalf("pause basis = version %d hit %d, want version %d hit 3",
+			result.Paused.BreakpointVersion, result.Paused.HitCount, record.ID)
+	}
+	if snap := sess.Snapshot(); snap.HitCount != 3 {
+		t.Fatalf("snapshot hit count = %d, want 3", snap.HitCount)
+	}
+
+	// The preview shows the hit target on the current version and the
+	// stop counted as one hit for that version.
+	view := sess.BreakpointsView()
+	if len(view.Current) != 1 || view.Current[0].HitCount != 3 || view.Current[0].Hits != 1 {
+		t.Fatalf("current = %+v, want hitCount 3 with 1 recorded hit", view.Current)
+	}
+
+	// A second continue fires again on the next multiple of the target.
+	again, err := sess.ContinueEx("alice", result.Paused.PauseID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.Paused == nil || again.Paused.HitCount != 6 {
+		t.Fatalf("second pause = %+v, want hit 6", again)
+	}
+}

@@ -26,11 +26,14 @@ const (
 )
 
 // BreakpointSpec is one breakpoint in a version or candidate: location,
-// enable state, and an optional condition expression.
+// enable state, an optional condition expression, and an optional
+// hit-count target. HitCount <= 1 stops on every hit; HitCount N stops
+// on every Nth hit.
 type BreakpointSpec struct {
 	Line      int    `json:"line"`
 	Enabled   bool   `json:"enabled"`
 	Condition string `json:"condition,omitempty"`
+	HitCount  int    `json:"hitCount,omitempty"`
 }
 
 // BreakpointStatus pairs a spec with the hit count and condition diagnostic
@@ -119,6 +122,7 @@ func executorBreakpoints(specs []BreakpointSpec) map[int]executor.Breakpoint {
 			Line:      spec.Line,
 			Enabled:   spec.Enabled,
 			Condition: spec.Condition,
+			HitCount:  spec.HitCount,
 		}
 	}
 	return out

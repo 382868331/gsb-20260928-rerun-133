@@ -28,7 +28,7 @@ UNIX_SOCKET=/tmp/debugd.sock BASE_URL=http://debug ./scripts/debug-client.sh
 - `POST /sessions/{id}/pause`：`{"clientId":"alice","requestId":"r2"}`，运行中请求下一条指令边界暂停。
 - `POST /sessions/{id}/breakpoints`：`{"lines":[2],"clientId":"alice","requestId":"r3"}`，替换完整断点集，在安全位置生效。
 - `GET /sessions/{id}/breakpoints`：预览断点版本：当前版本（含每条断点的启停、条件、命中次数与条件诊断）、候选列表与历史版本；observer 也可读取。
-- `POST /sessions/{id}/breakpoints/candidates`：`{"breakpoints":[{"line":2,"enabled":true,"condition":"i > 1"}],"clientId":"alice","requestId":"r4"}`，暂存一个可预览的候选版本，记录准备时的暂停与命中基线。
+- `POST /sessions/{id}/breakpoints/candidates`：`{"breakpoints":[{"line":2,"enabled":true,"condition":"i > 1","hitCount":3}],"clientId":"alice","requestId":"r4"}`，暂存一个可预览的候选版本，记录准备时的暂停与命中基线。
 - `POST /sessions/{id}/breakpoints/adopt`：`{"candidateId":1,"clientId":"alice","requestId":"r5"}`，仅当前控制者可采用；新版本从下一次 continue 起生效，返回的 `effectivePauseId` 指明生效起点。
 - `POST /sessions/{id}/breakpoints/refresh`：`{"candidateId":1,"clientId":"alice"}`，核对后重新基线化被标记的候选。
 - `POST /sessions/{id}/source`：`{"clientId":"alice","validLines":[2,3]}`，报告源码变化；所有待采用候选被标记需要重新核对的位置与命中记录。
@@ -45,6 +45,8 @@ UNIX_SOCKET=/tmp/debugd.sock BASE_URL=http://debug ./scripts/debug-client.sh
 - 断点按版本管理：每次采用（或 `POST /breakpoints` 直接替换）生成递增版本号；每个暂停快照带 `breakpointVersion`，可核对本次暂停实际使用的版本。版本被替换时其命中次数归档进历史，重开后可区分已发生的命中与尚未生效的候选修改。
 - 候选在准备后遇到新一轮暂停或源码变化会被标记 `recheck`（指出需重新核对的位置与命中记录），被标记的候选不能静默采用（`409`），必须先 refresh 或重新暂存；旧控制者的迟到采用返回 `403`，不会改变当前版本。
 - 断点条件支持 `name`、`name == N`、`!=`、`<`、`<=`、`>`、`>=`；条件求值出错会以 `reason=condition-error` 暂停并保留诊断（快照与状态中的 `conditionError`），不计为命中也不当作未命中。
+- 断点支持 `hitCount` 次数约束：`hitCount:N` 时条件每通过 N 次才暂停一次（缺省为每次命中都停）。各断点分别累计次数；条件求值失败不受次数约束影响，仍立即以 `condition-error` 暂停并给出诊断。每次暂停的快照带 `hitCount`，记录本次暂停实际依据的命中次数，与 `breakpointVersion` 一起可核对版本与次数依据。
+- 执行器侧按断点规格累计次数：规格（启停、条件、次数目标）不变的断点在断点集重装后继续累计；被修改、停用后重启用或新加的断点从零重新计数，被移除的行计数随之丢弃。采用新版本时会话侧命中记录归档进历史，新版本重新累计。
 - 执行器退出（含异常）不会销毁会话事件循环：退出前已入队与退出后新到达的请求都会得到明确结果（终止快照或 `410 Gone`），不会留在无人消费的队列里；只有服务端关闭会话时才回收循环，且会等所有已受理请求处理完。
 - 终止快照通过 `reason` 返回终止原因（如 `exception`/`exit`），通过 `lastPause` 返回最后一次暂停（含 `pauseId`、位置与变量）；旧 `pauseId` 始终不能读取新暂停或终止后的状态。
 - 虚拟程序 `raise` 会异常终止并返回 `reason=exception`，用于验证所有等待都被结束。

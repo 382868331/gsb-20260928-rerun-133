@@ -45,6 +45,10 @@ type Snapshot struct {
 	// ConditionError carries the diagnostic when the stop was caused by a
 	// broken breakpoint condition.
 	ConditionError string `json:"conditionError,omitempty"`
+	// HitCount is the accumulated hit count of the breakpoint that
+	// produced this pause, so every stop can be checked against the hit
+	// basis recorded by the executor.
+	HitCount int `json:"hitCount,omitempty"`
 }
 
 type WaitResult = Snapshot
@@ -106,6 +110,7 @@ type Session struct {
 	line       int
 	vars       map[string]int64
 	pauseID    int
+	hitCount   int
 	lastPause  *Snapshot
 	// bpSpecs is the authoritative breakpoint set of the current version.
 	bpSpecs []BreakpointSpec
@@ -246,6 +251,7 @@ func (s *Session) onEvent(event executor.Event) {
 		s.line = event.Line
 		s.vars = cloneVars(event.Vars)
 		s.pauseID = event.PauseID
+		s.hitCount = event.HitCount
 		s.bpPauseVersion = s.bpPendingVersion
 		switch event.Reason {
 		case executor.ReasonBreakpoint:
@@ -260,12 +266,14 @@ func (s *Session) onEvent(event executor.Event) {
 			State: StateStopped, Reason: event.Reason, PauseID: event.PauseID,
 			Line: event.Line, PC: event.PC, Vars: cloneVars(event.Vars),
 			BreakpointVersion: s.bpPauseVersion, ConditionError: event.ConditionError,
+			HitCount: event.HitCount,
 		}
 		s.notify(Snapshot{
 			State: StateStopped, Reason: event.Reason, PauseID: s.pauseID,
 			Line: event.Line, PC: event.PC, Vars: cloneVars(event.Vars),
 			LastPause:         s.lastPauseRef(),
 			BreakpointVersion: s.bpPauseVersion, ConditionError: event.ConditionError,
+			HitCount: event.HitCount,
 		})
 	case executor.EventTerminated:
 		s.state = StateTerminated
@@ -358,6 +366,7 @@ func (s *Session) snapshotLocked() Snapshot {
 		State: s.state, Reason: s.reason, PauseID: s.pauseID,
 		Line: s.line, PC: s.pc, Controller: s.controller,
 		BreakpointVersion: s.bpPauseVersion,
+		HitCount:          s.hitCount,
 	}
 	if s.state == StateStopped {
 		snapshot.Vars = cloneVars(s.vars)
