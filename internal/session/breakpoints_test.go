@@ -320,3 +320,79 @@ func TestReconnectKeepsVersionsAndCandidates(t *testing.T) {
 		t.Fatalf("duplicate candidate staged: %+v", view.Candidates)
 	}
 }
+
+func TestHitCountPauseRecordsBasis(t *testing.T) {
+	sess := newSession(t, "loop")
+	defer sess.Close()
+	if _, err := sess.Attach("alice", true, false); err != nil {
+		t.Fatal(err)
+	}
+	candidate, err := sess.StageCandidate("alice", []session.BreakpointSpec{
+		{Line: 2, Enabled: true, HitCount: 3},
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The preview shows the threshold before adoption.
+	view := sess.BreakpointsView()
+	staged := findCandidate(view, candidate.ID)
+	if staged == nil || staged.Breakpoints[0].HitCount != 3 {
+		t.Fatalf("candidate preview = %+v", staged)
+	}
+	record, err := sess.AdoptCandidate("alice", candidate.ID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Breakpoints[0].HitCount != 3 {
+		t.Fatalf("adopted record = %+v", record)
+	}
+
+	entry := sess.Snapshot().PauseID
+	result, err := sess.ContinueEx("alice", entry, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Paused == nil || result.Paused.Reason != executor.ReasonBreakpoint {
+		t.Fatalf("continue = %+v", result)
+	}
+	// The pause records the hit-count basis it was produced from.
+	if result.Paused.Hits != 3 || result.Paused.HitTarget != 3 {
+		t.Fatalf("pause basis = %d/%d, want 3/3", result.Paused.Hits, result.Paused.HitTarget)
+	}
+	if result.Paused.BreakpointVersion != record.ID {
+		t.Fatalf("pause version = %d, want %d", result.Paused.BreakpointVersion, record.ID)
+	}
+	// Preview, adoption, and pause record agree on the hit accounting.
+	view = sess.BreakpointsView()
+	if len(view.Current) != 1 || view.Current[0].HitCount != 3 || view.Current[0].Hits != 3 {
+		t.Fatalf("current status = %+v", view.Current)
+	}
+}
+
+func TestHitCountConditionErrorStillStops(t *testing.T) {
+	sess := newSession(t, "loop")
+	defer sess.Close()
+	if _, err := sess.Attach("alice", true, false); err != nil {
+		t.Fatal(err)
+	}
+	candidate, err := sess.StageCandidate("alice", []session.BreakpointSpec{
+		{Line: 2, Enabled: true, Condition: "nope > 1", HitCount: 100},
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sess.AdoptCandidate("alice", candidate.ID, ""); err != nil {
+		t.Fatal(err)
+	}
+	entry := sess.Snapshot().PauseID
+	result, err := sess.ContinueEx("alice", entry, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Paused == nil || result.Paused.Reason != executor.ReasonConditionError {
+		t.Fatalf("unmet hit count masked condition error: %+v", result)
+	}
+	if result.Paused.ConditionError == "" {
+		t.Fatalf("diagnostic lost: %+v", result.Paused)
+	}
+}

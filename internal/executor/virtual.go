@@ -69,6 +69,7 @@ type Virtual struct {
 	shutdownFlag atomic.Bool
 	breakpointMu sync.RWMutex
 	breakpoints  map[int]Breakpoint
+	hitCounts    map[int]int
 	doneOnce     sync.Once
 }
 
@@ -79,6 +80,7 @@ func NewVirtual(program Program) *Virtual {
 		done:        make(chan struct{}),
 		shutdown:    make(chan struct{}),
 		breakpoints: map[int]Breakpoint{},
+		hitCounts:   map[int]int{},
 	}
 }
 
@@ -106,6 +108,9 @@ func (v *Virtual) UpdateBreakpoints(breakpoints map[int]Breakpoint) bool {
 	default:
 	}
 	v.breakpoints = copyBreakpoints(breakpoints)
+	// A new breakpoint set re-bases the hit counters: hits accumulated
+	// under a previous version never carry into the new one.
+	v.hitCounts = map[int]int{}
 	return true
 }
 
@@ -129,7 +134,7 @@ func (v *Virtual) run(events chan<- Event) {
 		_ = done
 	}
 
-	waitAtSafePoint := func(reason string, pc int, conditionError string) bool {
+	waitAtSafePoint := func(reason string, pc int, conditionError string, hits int, hitTarget int) bool {
 		nextPause++
 		currentPause := nextPause
 		resume := make(chan int, 1)
@@ -143,6 +148,8 @@ func (v *Virtual) run(events chan<- Event) {
 			Line:           v.program.Code[pc].Line,
 			Vars:           cloneVars(vars),
 			ConditionError: conditionError,
+			Hits:           hits,
+			HitTarget:      hitTarget,
 		}
 	waitForCurrent:
 		for {
@@ -159,7 +166,7 @@ func (v *Virtual) run(events chan<- Event) {
 		}
 	}
 
-	if !waitAtSafePoint(ReasonEntry, 0, "") {
+	if !waitAtSafePoint(ReasonEntry, 0, "", 0, 0) {
 		return
 	}
 	pc := 0
@@ -172,7 +179,7 @@ func (v *Virtual) run(events chan<- Event) {
 
 		ins := v.program.Code[pc]
 		if v.pauseFlag.Swap(false) {
-			if !waitAtSafePoint(ReasonPause, pc, "") {
+			if !waitAtSafePoint(ReasonPause, pc, "", 0, 0) {
 				return
 			}
 			continue
@@ -182,13 +189,20 @@ func (v *Virtual) run(events chan<- Event) {
 			switch {
 			case err != nil:
 				// A broken condition is a diagnostic stop, never a
-				// silent miss.
-				if !waitAtSafePoint(ReasonConditionError, pc, err.Error()) {
+				// silent miss, and the hit-count threshold must not
+				// mask it.
+				if !waitAtSafePoint(ReasonConditionError, pc, err.Error(), 0, 0) {
 					return
 				}
 				continue
 			case pass:
-				if !waitAtSafePoint(ReasonBreakpoint, pc, "") {
+				hits := v.countHit(ins.Line)
+				if bp.HitCount > 1 && hits < bp.HitCount {
+					// Passing hit below the threshold: counted
+					// but not a stop.
+					break
+				}
+				if !waitAtSafePoint(ReasonBreakpoint, pc, "", hits, bp.HitCount) {
 					return
 				}
 				continue
@@ -219,6 +233,15 @@ func (v *Virtual) getBreakpoint(line int) (Breakpoint, bool) {
 	defer v.breakpointMu.RUnlock()
 	bp, ok := v.breakpoints[line]
 	return bp, ok
+}
+
+// countHit records one passing hit for line and returns the cumulative
+// count under the currently installed breakpoint set.
+func (v *Virtual) countHit(line int) int {
+	v.breakpointMu.Lock()
+	defer v.breakpointMu.Unlock()
+	v.hitCounts[line]++
+	return v.hitCounts[line]
 }
 
 func cloneVars(in map[string]int64) map[string]int64 {

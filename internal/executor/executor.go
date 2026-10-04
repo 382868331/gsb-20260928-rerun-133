@@ -14,6 +14,12 @@ type Event struct {
 	// fails to evaluate. The stop is reported instead of being silently
 	// treated as a miss.
 	ConditionError string `json:"conditionError,omitempty"`
+	// Hits is the cumulative hit count of the breakpoint that produced
+	// this stop, and HitTarget the hit-count threshold it had to reach.
+	// Together they let every pause be checked against the hit-count
+	// basis that triggered it.
+	Hits      int `json:"hits,omitempty"`
+	HitTarget int `json:"hitTarget,omitempty"`
 }
 
 type EventType string
@@ -32,12 +38,16 @@ const (
 	ReasonConditionError = "condition-error"
 )
 
-// Breakpoint is one installed breakpoint: a line, an enable flag, and an
-// optional condition expression evaluated against the current variables.
+// Breakpoint is one installed breakpoint: a line, an enable flag, an
+// optional condition expression evaluated against the current variables,
+// and an optional hit-count threshold. HitCount <= 1 stops on every
+// passing hit; HitCount N stops only on the N-th passing hit. A broken
+// condition stops with a diagnostic regardless of the threshold.
 type Breakpoint struct {
 	Line      int    `json:"line"`
 	Enabled   bool   `json:"enabled"`
 	Condition string `json:"condition,omitempty"`
+	HitCount  int    `json:"hitCount,omitempty"`
 }
 
 // Executor is the adapter contract between the protocol service and a concrete

@@ -45,6 +45,11 @@ type Snapshot struct {
 	// ConditionError carries the diagnostic when the stop was caused by a
 	// broken breakpoint condition.
 	ConditionError string `json:"conditionError,omitempty"`
+	// Hits is the cumulative hit count of the breakpoint that produced
+	// this pause, and HitTarget the threshold it had to reach, so every
+	// pause can be checked against the hit-count basis that triggered it.
+	Hits      int `json:"hits,omitempty"`
+	HitTarget int `json:"hitTarget,omitempty"`
 }
 
 type WaitResult = Snapshot
@@ -249,7 +254,15 @@ func (s *Session) onEvent(event executor.Event) {
 		s.bpPauseVersion = s.bpPendingVersion
 		switch event.Reason {
 		case executor.ReasonBreakpoint:
-			s.bpHits[event.Line]++
+			// The executor owns the cumulative count (it also sees
+			// hits that stayed below the hit-count threshold); the
+			// session records it so preview, adoption, and pause
+			// records agree.
+			if event.Hits > 0 {
+				s.bpHits[event.Line] = event.Hits
+			} else {
+				s.bpHits[event.Line]++
+			}
 		case executor.ReasonConditionError:
 			// A broken condition keeps its diagnostic; it is neither a
 			// hit nor a silent miss.
@@ -260,12 +273,14 @@ func (s *Session) onEvent(event executor.Event) {
 			State: StateStopped, Reason: event.Reason, PauseID: event.PauseID,
 			Line: event.Line, PC: event.PC, Vars: cloneVars(event.Vars),
 			BreakpointVersion: s.bpPauseVersion, ConditionError: event.ConditionError,
+			Hits: event.Hits, HitTarget: event.HitTarget,
 		}
 		s.notify(Snapshot{
 			State: StateStopped, Reason: event.Reason, PauseID: s.pauseID,
 			Line: event.Line, PC: event.PC, Vars: cloneVars(event.Vars),
 			LastPause:         s.lastPauseRef(),
 			BreakpointVersion: s.bpPauseVersion, ConditionError: event.ConditionError,
+			Hits: event.Hits, HitTarget: event.HitTarget,
 		})
 	case executor.EventTerminated:
 		s.state = StateTerminated
@@ -475,7 +490,12 @@ func (s *Session) ContinueEx(clientID string, pauseID int, requestID string) (Co
 			}
 			currentPauseID := s.pauseID
 			s.waiters[w] = struct{}{}
-			s.engine.UpdateBreakpoints(executorBreakpoints(s.bpSpecs))
+			// Push the breakpoint set only when the version changed;
+			// reinstalling the same version would re-base the
+			// executor's hit counters and lose hits already counted.
+			if s.bpPendingVersion != s.bpVersion {
+				s.engine.UpdateBreakpoints(executorBreakpoints(s.bpSpecs))
+			}
 			s.state = StateRunning
 			s.pauseID = 0
 			s.bpPendingVersion = s.bpVersion
