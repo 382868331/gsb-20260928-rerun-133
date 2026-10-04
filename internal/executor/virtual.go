@@ -68,7 +68,7 @@ type Virtual struct {
 	shutdown     chan struct{}
 	shutdownFlag atomic.Bool
 	breakpointMu sync.RWMutex
-	breakpoints  map[int]bool
+	breakpoints  map[int]Breakpoint
 	doneOnce     sync.Once
 }
 
@@ -78,7 +78,7 @@ func NewVirtual(program Program) *Virtual {
 		resume:      atomic.Pointer[chan int]{},
 		done:        make(chan struct{}),
 		shutdown:    make(chan struct{}),
-		breakpoints: map[int]bool{},
+		breakpoints: map[int]Breakpoint{},
 	}
 }
 
@@ -88,7 +88,7 @@ func (v *Virtual) Pause() {
 
 func (v *Virtual) Start(events chan<- Event) { go v.run(events) }
 
-func (v *Virtual) Resume(pauseID int, _ map[int]bool) {
+func (v *Virtual) Resume(pauseID int, _ map[int]Breakpoint) {
 	if resume := v.resume.Load(); resume != nil {
 		select {
 		case *resume <- pauseID:
@@ -97,7 +97,7 @@ func (v *Virtual) Resume(pauseID int, _ map[int]bool) {
 	}
 }
 
-func (v *Virtual) UpdateBreakpoints(breakpoints map[int]bool) bool {
+func (v *Virtual) UpdateBreakpoints(breakpoints map[int]Breakpoint) bool {
 	v.breakpointMu.Lock()
 	defer v.breakpointMu.Unlock()
 	select {
@@ -129,19 +129,20 @@ func (v *Virtual) run(events chan<- Event) {
 		_ = done
 	}
 
-	waitAtSafePoint := func(reason string, pc int) bool {
+	waitAtSafePoint := func(reason string, pc int, conditionError string) bool {
 		nextPause++
 		currentPause := nextPause
 		resume := make(chan int, 1)
 		v.resume.Store(&resume)
 		defer v.resume.Store(nil)
 		events <- Event{
-			Type:    EventStopped,
-			Reason:  reason,
-			PauseID: currentPause,
-			PC:      pc,
-			Line:    v.program.Code[pc].Line,
-			Vars:    cloneVars(vars),
+			Type:           EventStopped,
+			Reason:         reason,
+			PauseID:        currentPause,
+			PC:             pc,
+			Line:           v.program.Code[pc].Line,
+			Vars:           cloneVars(vars),
+			ConditionError: conditionError,
 		}
 	waitForCurrent:
 		for {
@@ -158,7 +159,7 @@ func (v *Virtual) run(events chan<- Event) {
 		}
 	}
 
-	if !waitAtSafePoint(ReasonEntry, 0) {
+	if !waitAtSafePoint(ReasonEntry, 0, "") {
 		return
 	}
 	pc := 0
@@ -171,16 +172,27 @@ func (v *Virtual) run(events chan<- Event) {
 
 		ins := v.program.Code[pc]
 		if v.pauseFlag.Swap(false) {
-			if !waitAtSafePoint(ReasonPause, pc) {
+			if !waitAtSafePoint(ReasonPause, pc, "") {
 				return
 			}
 			continue
 		}
-		if v.hasBreakpoint(ins.Line) {
-			if !waitAtSafePoint(ReasonBreakpoint, pc) {
-				return
+		if bp, ok := v.getBreakpoint(ins.Line); ok && bp.Enabled {
+			pass, err := EvalCondition(bp.Condition, vars)
+			switch {
+			case err != nil:
+				// A broken condition is a diagnostic stop, never a
+				// silent miss.
+				if !waitAtSafePoint(ReasonConditionError, pc, err.Error()) {
+					return
+				}
+				continue
+			case pass:
+				if !waitAtSafePoint(ReasonBreakpoint, pc, "") {
+					return
+				}
+				continue
 			}
-			continue
 		}
 
 		switch ins.Op {
@@ -202,10 +214,11 @@ func (v *Virtual) run(events chan<- Event) {
 	finish(ReasonExit)
 }
 
-func (v *Virtual) hasBreakpoint(line int) bool {
+func (v *Virtual) getBreakpoint(line int) (Breakpoint, bool) {
 	v.breakpointMu.RLock()
 	defer v.breakpointMu.RUnlock()
-	return v.breakpoints[line]
+	bp, ok := v.breakpoints[line]
+	return bp, ok
 }
 
 func cloneVars(in map[string]int64) map[string]int64 {
@@ -216,12 +229,10 @@ func cloneVars(in map[string]int64) map[string]int64 {
 	return out
 }
 
-func copyBreakpoints(in map[int]bool) map[int]bool {
-	out := make(map[int]bool, len(in))
-	for line, enabled := range in {
-		if enabled {
-			out[line] = true
-		}
+func copyBreakpoints(in map[int]Breakpoint) map[int]Breakpoint {
+	out := make(map[int]Breakpoint, len(in))
+	for line, bp := range in {
+		out[line] = bp
 	}
 	return out
 }

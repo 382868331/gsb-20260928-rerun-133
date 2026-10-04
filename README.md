@@ -27,6 +27,11 @@ UNIX_SOCKET=/tmp/debugd.sock BASE_URL=http://debug ./scripts/debug-client.sh
 - `POST /sessions/{id}/continue`：`{"pauseId":1,"clientId":"alice","requestId":"r1"}`，只允许操作当前暂停。
 - `POST /sessions/{id}/pause`：`{"clientId":"alice","requestId":"r2"}`，运行中请求下一条指令边界暂停。
 - `POST /sessions/{id}/breakpoints`：`{"lines":[2],"clientId":"alice","requestId":"r3"}`，替换完整断点集，在安全位置生效。
+- `GET /sessions/{id}/breakpoints`：预览断点版本：当前版本（含每条断点的启停、条件、命中次数与条件诊断）、候选列表与历史版本；observer 也可读取。
+- `POST /sessions/{id}/breakpoints/candidates`：`{"breakpoints":[{"line":2,"enabled":true,"condition":"i > 1"}],"clientId":"alice","requestId":"r4"}`，暂存一个可预览的候选版本，记录准备时的暂停与命中基线。
+- `POST /sessions/{id}/breakpoints/adopt`：`{"candidateId":1,"clientId":"alice","requestId":"r5"}`，仅当前控制者可采用；新版本从下一次 continue 起生效，返回的 `effectivePauseId` 指明生效起点。
+- `POST /sessions/{id}/breakpoints/refresh`：`{"candidateId":1,"clientId":"alice"}`，核对后重新基线化被标记的候选。
+- `POST /sessions/{id}/source`：`{"clientId":"alice","validLines":[2,3]}`，报告源码变化；所有待采用候选被标记需要重新核对的位置与命中记录。
 - `POST /sessions/{id}/variables`：`{"pauseId":1,"names":["i"]}`，只读取指定暂停的一致快照。
 
 ## 并发语义
@@ -37,6 +42,9 @@ UNIX_SOCKET=/tmp/debugd.sock BASE_URL=http://debug ./scripts/debug-client.sh
 - 推进类请求支持 `requestId` 幂等：重连后的重复请求返回已存结果并带 `duplicate:true`，不会再次推进程序；进行中的重复请求返回 `409` 表示已在处理。
 - 重复继续在运行中返回 `409 Conflict`，终止后返回 `410 Gone`。
 - 断点修改先更新会话权威集合，再由执行器在指令边界读取。
+- 断点按版本管理：每次采用（或 `POST /breakpoints` 直接替换）生成递增版本号；每个暂停快照带 `breakpointVersion`，可核对本次暂停实际使用的版本。版本被替换时其命中次数归档进历史，重开后可区分已发生的命中与尚未生效的候选修改。
+- 候选在准备后遇到新一轮暂停或源码变化会被标记 `recheck`（指出需重新核对的位置与命中记录），被标记的候选不能静默采用（`409`），必须先 refresh 或重新暂存；旧控制者的迟到采用返回 `403`，不会改变当前版本。
+- 断点条件支持 `name`、`name == N`、`!=`、`<`、`<=`、`>`、`>=`；条件求值出错会以 `reason=condition-error` 暂停并保留诊断（快照与状态中的 `conditionError`），不计为命中也不当作未命中。
 - 执行器退出（含异常）不会销毁会话事件循环：退出前已入队与退出后新到达的请求都会得到明确结果（终止快照或 `410 Gone`），不会留在无人消费的队列里；只有服务端关闭会话时才回收循环，且会等所有已受理请求处理完。
 - 终止快照通过 `reason` 返回终止原因（如 `exception`/`exit`），通过 `lastPause` 返回最后一次暂停（含 `pauseId`、位置与变量）；旧 `pauseId` 始终不能读取新暂停或终止后的状态。
 - 虚拟程序 `raise` 会异常终止并返回 `reason=exception`，用于验证所有等待都被结束。

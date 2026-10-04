@@ -32,6 +32,11 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /sessions/{id}/continue", s.withSession(s.continueSession))
 	mux.HandleFunc("POST /sessions/{id}/pause", s.withSession(s.pauseSession))
 	mux.HandleFunc("POST /sessions/{id}/breakpoints", s.withSession(s.setBreakpoints))
+	mux.HandleFunc("GET /sessions/{id}/breakpoints", s.withSession(s.getBreakpoints))
+	mux.HandleFunc("POST /sessions/{id}/breakpoints/candidates", s.withSession(s.stageCandidate))
+	mux.HandleFunc("POST /sessions/{id}/breakpoints/adopt", s.withSession(s.adoptCandidate))
+	mux.HandleFunc("POST /sessions/{id}/breakpoints/refresh", s.withSession(s.refreshCandidate))
+	mux.HandleFunc("POST /sessions/{id}/source", s.withSession(s.sourceChanged))
 	mux.HandleFunc("POST /sessions/{id}/variables", s.withSession(s.variables))
 	return logging(mux)
 }
@@ -178,6 +183,82 @@ func (s *Server) setBreakpoints(w http.ResponseWriter, r *http.Request, sess *se
 	writeJSON(w, http.StatusOK, result)
 }
 
+// getBreakpoints previews the breakpoint versions, staged candidates, and
+// live hit/diagnostic state. Observers may read it; only the controller can
+// change anything it shows.
+func (s *Server) getBreakpoints(w http.ResponseWriter, _ *http.Request, sess *session.Session) {
+	writeJSON(w, http.StatusOK, sess.BreakpointsView())
+}
+
+func (s *Server) stageCandidate(w http.ResponseWriter, r *http.Request, sess *session.Session) {
+	var body struct {
+		Breakpoints []session.BreakpointSpec `json:"breakpoints"`
+		ClientID    string                   `json:"clientId"`
+		RequestID   string                   `json:"requestId"`
+	}
+	if err := decodeBody(r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	candidate, err := sess.StageCandidate(body.ClientID, body.Breakpoints, body.RequestID)
+	if err != nil {
+		writeSessionError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, candidate)
+}
+
+func (s *Server) adoptCandidate(w http.ResponseWriter, r *http.Request, sess *session.Session) {
+	var body struct {
+		CandidateID int    `json:"candidateId"`
+		ClientID    string `json:"clientId"`
+		RequestID   string `json:"requestId"`
+	}
+	if err := decodeBody(r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	record, err := sess.AdoptCandidate(body.ClientID, body.CandidateID, body.RequestID)
+	if err != nil {
+		writeSessionError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, record)
+}
+
+func (s *Server) refreshCandidate(w http.ResponseWriter, r *http.Request, sess *session.Session) {
+	var body struct {
+		CandidateID int    `json:"candidateId"`
+		ClientID    string `json:"clientId"`
+	}
+	if err := decodeBody(r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	candidate, err := sess.RefreshCandidate(body.ClientID, body.CandidateID)
+	if err != nil {
+		writeSessionError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, candidate)
+}
+
+func (s *Server) sourceChanged(w http.ResponseWriter, r *http.Request, sess *session.Session) {
+	var body struct {
+		ClientID   string `json:"clientId"`
+		ValidLines []int  `json:"validLines"`
+	}
+	if err := decodeBody(r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := sess.NotifySourceChange(body.ClientID, body.ValidLines); err != nil {
+		writeSessionError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, sess.BreakpointsView())
+}
+
 func (s *Server) variables(w http.ResponseWriter, r *http.Request, sess *session.Session) {
 	var body struct {
 		PauseID int      `json:"pauseId"`
@@ -209,6 +290,10 @@ func writeSessionError(w http.ResponseWriter, err error) bool {
 		status = http.StatusConflict
 	case errors.Is(err, session.ErrNotController):
 		status = http.StatusForbidden
+	case errors.Is(err, session.ErrCandidateStale):
+		status = http.StatusConflict
+	case errors.Is(err, session.ErrUnknownCandidate):
+		status = http.StatusNotFound
 	case errors.Is(err, session.ErrUnknownClient):
 		status = http.StatusBadRequest
 	default:

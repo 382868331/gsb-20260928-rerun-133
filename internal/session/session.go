@@ -39,6 +39,12 @@ type Snapshot struct {
 	Vars       map[string]int64 `json:"vars,omitempty"`
 	LastPause  *Snapshot        `json:"lastPause,omitempty"`
 	Controller string           `json:"controller,omitempty"`
+	// BreakpointVersion is the breakpoint version this pause actually ran
+	// under, so every stop can be checked against the version in effect.
+	BreakpointVersion int `json:"breakpointVersion,omitempty"`
+	// ConditionError carries the diagnostic when the stop was caused by a
+	// broken breakpoint condition.
+	ConditionError string `json:"conditionError,omitempty"`
 }
 
 type WaitResult = Snapshot
@@ -101,7 +107,25 @@ type Session struct {
 	vars       map[string]int64
 	pauseID    int
 	lastPause  *Snapshot
-	breakpoint map[int]bool
+	// bpSpecs is the authoritative breakpoint set of the current version.
+	bpSpecs []BreakpointSpec
+	// bpVersion numbers the authoritative set; bpPauseVersion records the
+	// version the current pause ran under; bpPendingVersion is the version
+	// pushed to the executor at the last resume.
+	bpVersion        int
+	bpPauseVersion   int
+	bpPendingVersion int
+	bpAdoptedBy      string
+	bpEffectivePause int
+	// bpHits and bpCondErrs accumulate hits and condition diagnostics for
+	// the current version only; they are archived into bpHistory when a
+	// new version is installed.
+	bpHits     map[int]int
+	bpCondErrs map[int]string
+	bpHistory  []VersionRecord
+	// candidates holds staged breakpoint changes awaiting adoption.
+	candidates      []*Candidate
+	nextCandidateID int
 	// controller is the client that owns execution advancement. Observers
 	// may read state but cannot resume, pause, or move breakpoints.
 	controller string
@@ -114,20 +138,25 @@ type requestOutcome struct {
 	continueResult *ContinueResult
 	pauseResult    *WaitResult
 	breakpoints    map[string]any
+	candidate      *Candidate
+	version        *VersionRecord
 	err            error
 }
 
 func New(id string, engine Engine) *Session {
 	s := &Session{
-		id:         id,
-		engine:     engine,
-		cmds:       make(chan command, 32),
-		done:       make(chan struct{}),
-		terminated: make(chan struct{}),
-		waiters:    map[waiter]struct{}{},
-		state:      StateRunning,
-		breakpoint: map[int]bool{},
-		completed:  map[string]requestOutcome{},
+		id:               id,
+		engine:           engine,
+		cmds:             make(chan command, 32),
+		done:             make(chan struct{}),
+		terminated:       make(chan struct{}),
+		waiters:          map[waiter]struct{}{},
+		state:            StateRunning,
+		bpPendingVersion: 1,
+		bpVersion:        1,
+		bpHits:           map[int]int{},
+		bpCondErrs:       map[int]string{},
+		completed:        map[string]requestOutcome{},
 	}
 	events := make(chan executor.Event, 8)
 	s.readyWG.Add(1)
@@ -217,14 +246,26 @@ func (s *Session) onEvent(event executor.Event) {
 		s.line = event.Line
 		s.vars = cloneVars(event.Vars)
 		s.pauseID = event.PauseID
+		s.bpPauseVersion = s.bpPendingVersion
+		switch event.Reason {
+		case executor.ReasonBreakpoint:
+			s.bpHits[event.Line]++
+		case executor.ReasonConditionError:
+			// A broken condition keeps its diagnostic; it is neither a
+			// hit nor a silent miss.
+			s.bpCondErrs[event.Line] = event.ConditionError
+		}
+		s.flagCandidatesOnPauseLocked()
 		s.lastPause = &Snapshot{
 			State: StateStopped, Reason: event.Reason, PauseID: event.PauseID,
 			Line: event.Line, PC: event.PC, Vars: cloneVars(event.Vars),
+			BreakpointVersion: s.bpPauseVersion, ConditionError: event.ConditionError,
 		}
 		s.notify(Snapshot{
 			State: StateStopped, Reason: event.Reason, PauseID: s.pauseID,
 			Line: event.Line, PC: event.PC, Vars: cloneVars(event.Vars),
-			LastPause: s.lastPauseRef(),
+			LastPause:         s.lastPauseRef(),
+			BreakpointVersion: s.bpPauseVersion, ConditionError: event.ConditionError,
 		})
 	case executor.EventTerminated:
 		s.state = StateTerminated
@@ -316,6 +357,7 @@ func (s *Session) snapshotLocked() Snapshot {
 	snapshot := Snapshot{
 		State: s.state, Reason: s.reason, PauseID: s.pauseID,
 		Line: s.line, PC: s.pc, Controller: s.controller,
+		BreakpointVersion: s.bpPauseVersion,
 	}
 	if s.state == StateStopped {
 		snapshot.Vars = cloneVars(s.vars)
@@ -433,10 +475,11 @@ func (s *Session) ContinueEx(clientID string, pauseID int, requestID string) (Co
 			}
 			currentPauseID := s.pauseID
 			s.waiters[w] = struct{}{}
-			s.engine.UpdateBreakpoints(s.breakpoint)
+			s.engine.UpdateBreakpoints(executorBreakpoints(s.bpSpecs))
 			s.state = StateRunning
 			s.pauseID = 0
-			s.engine.Resume(currentPauseID, s.breakpoint)
+			s.bpPendingVersion = s.bpVersion
+			s.engine.Resume(currentPauseID, executorBreakpoints(s.bpSpecs))
 			outCh <- outcome{pending: true}
 		}
 	})
@@ -553,10 +596,6 @@ func (s *Session) SetBreakpoints(lines []int) (map[string]any, error) {
 // may change breakpoints. A non-empty requestID makes the call idempotent:
 // a retry reports the stored result instead of re-applying.
 func (s *Session) SetBreakpointsEx(clientID string, lines []int, requestID string) (map[string]any, error) {
-	next := make(map[int]bool, len(lines))
-	for _, line := range lines {
-		next[line] = true
-	}
 	result := make(chan map[string]any, 1)
 	errCh := make(chan error, 1)
 	s.submit(func(s *Session) {
@@ -584,12 +623,13 @@ func (s *Session) SetBreakpointsEx(clientID string, lines []int, requestID strin
 			fail(ErrNotController)
 			return
 		}
-		s.breakpoint = next
-		pending := false
-		if s.state == StateRunning {
-			pending = s.engine.UpdateBreakpoints(next)
+		specs := make([]BreakpointSpec, 0, len(lines))
+		for _, line := range lines {
+			specs = append(specs, BreakpointSpec{Line: line, Enabled: true})
 		}
-		applied := map[string]any{"breakpoints": lines, "pending": pending}
+		pending := s.state == StateRunning
+		s.installVersionLocked(specs, clientID)
+		applied := map[string]any{"breakpoints": lines, "pending": pending, "version": s.bpVersion}
 		if requestID != "" {
 			s.completed[requestID] = requestOutcome{breakpoints: applied}
 		}
