@@ -360,10 +360,11 @@ func TestHitCountCandidatePauseBasis(t *testing.T) {
 	}
 
 	// The preview shows the hit target on the current version and the
-	// stop counted as one hit for that version.
+	// raw number of condition passes, identical to the pause basis, so
+	// the current view and the pause record explain the same stop.
 	view := sess.BreakpointsView()
-	if len(view.Current) != 1 || view.Current[0].HitCount != 3 || view.Current[0].Hits != 1 {
-		t.Fatalf("current = %+v, want hitCount 3 with 1 recorded hit", view.Current)
+	if len(view.Current) != 1 || view.Current[0].HitCount != 3 || view.Current[0].Hits != 3 {
+		t.Fatalf("current = %+v, want hitCount 3 with 3 recorded hits", view.Current)
 	}
 
 	// A second continue fires again on the next multiple of the target.
@@ -373,5 +374,236 @@ func TestHitCountCandidatePauseBasis(t *testing.T) {
 	}
 	if again.Paused == nil || again.Paused.HitCount != 6 {
 		t.Fatalf("second pause = %+v, want hit 6", again)
+	}
+}
+
+// TestFourthHitPauseBooksConsistently is the reported regression: with a
+// hitCount:4 breakpoint the fourth condition pass pauses, and the current
+// status and archived history must each show four condition passes for that
+// breakpoint instead of collapsing the stop to a single unexplained hit.
+func TestFourthHitPauseBooksConsistently(t *testing.T) {
+	sess := newSession(t, "loop")
+	defer sess.Close()
+	if _, err := sess.Attach("alice", true, false); err != nil {
+		t.Fatal(err)
+	}
+	entry := sess.Snapshot()
+	candidate, err := sess.StageCandidate("alice", []session.BreakpointSpec{
+		{Line: 2, Enabled: true, HitCount: 4},
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := sess.AdoptCandidate("alice", candidate.ID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := sess.ContinueEx("alice", entry.PauseID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Paused == nil || result.Paused.HitCount != 4 {
+		t.Fatalf("pause = %+v, want stop on the 4th condition pass", result.Paused)
+	}
+	if snap := sess.Snapshot(); snap.HitCount != 4 {
+		t.Fatalf("snapshot hit count = %d, want 4", snap.HitCount)
+	}
+	view := sess.BreakpointsView()
+	if len(view.Current) != 1 || view.Current[0].Hits != 4 {
+		t.Fatalf("current hits = %+v, want 4 condition passes", view.Current)
+	}
+
+	// A candidate staged at this pause records the same 4-pass basis.
+	staged, err := sess.StageCandidate("alice", []session.BreakpointSpec{
+		{Line: 2, Enabled: true, HitCount: 4},
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	refreshed := findCandidate(sess.BreakpointsView(), staged.ID)
+	if refreshed == nil || refreshed.Recheck != nil {
+		t.Fatalf("fresh candidate recheck = %+v", refreshed)
+	}
+
+	// Adopting the unchanged version archives four condition passes with
+	// the version that produced the pause; both books agree.
+	next, err := sess.AdoptCandidate("alice", staged.ID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	view = sess.BreakpointsView()
+	var archived *session.VersionRecord
+	for i := range view.History {
+		if view.History[i].ID == record.ID {
+			archived = &view.History[i]
+		}
+	}
+	if archived == nil || archived.Hits[2] != 4 {
+		t.Fatalf("version %d archived hits = %+v, want 4", record.ID, view.History)
+	}
+	if next.ID != record.ID+1 {
+		t.Fatalf("new version id = %d", next.ID)
+	}
+	if len(view.Current) != 1 || view.Current[0].Hits != 0 {
+		t.Fatalf("new version must start from zero: %+v", view.Current)
+	}
+}
+
+// TestSilentPassesReconciledOnManualPause proves passes short of the target
+// (which never emit a stop) still show up in the books once another stop
+// lands, so a later hitCount pause can be explained.
+func TestSilentPassesReconciledOnManualPause(t *testing.T) {
+	sess := newSession(t, "loop")
+	defer sess.Close()
+	if _, err := sess.Attach("alice", true, false); err != nil {
+		t.Fatal(err)
+	}
+	candidate, err := sess.StageCandidate("alice", []session.BreakpointSpec{
+		{Line: 2, Enabled: true, HitCount: 100},
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sess.AdoptCandidate("alice", candidate.ID, ""); err != nil {
+		t.Fatal(err)
+	}
+	entry := sess.Snapshot().PauseID
+	// Resume and immediately request a boundary stop; some passes on the
+	// huge target happen before the request lands, but the target cannot
+	// be reached. The raw passes must be reconciled into the current view.
+	continueErr := make(chan error, 1)
+	go func() {
+		_, err := sess.ContinueEx("alice", entry, "")
+		continueErr <- err
+	}()
+	paused, err := sess.PauseEx("alice", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := <-continueErr; err != nil {
+		t.Fatal(err)
+	}
+	if paused.State != session.StateStopped {
+		t.Fatalf("pause result = %+v", paused)
+	}
+	if paused.Reason == executor.ReasonBreakpoint {
+		t.Fatalf("target unexpectedly reached: %+v", paused)
+	}
+	view := sess.BreakpointsView()
+	if len(view.Current) != 1 || view.Current[0].Hits == 0 {
+		t.Fatalf("silent passes not reconciled: %+v", view.Current)
+	}
+	if paused.HitCount != 0 {
+		t.Fatalf("manual pause must not claim a hit basis: %+v", paused)
+	}
+}
+
+// TestConditionErrorReconcilesSiblingHits verifies a condition error stops
+// immediately with its diagnostic and is never a hit, while passes on other
+// breakpoints that advanced before the error stop are still accounted.
+func TestConditionErrorReconcilesSiblingHits(t *testing.T) {
+	sess := newSession(t, "loop")
+	defer sess.Close()
+	if _, err := sess.Attach("alice", true, false); err != nil {
+		t.Fatal(err)
+	}
+	// Line 2 passes on a huge target (silently); line 3 breaks its
+	// condition. Line 2 executes first in the loop, so at least one silent
+	// pass must already be on the books when the line-3 diagnostic fires.
+	candidate, err := sess.StageCandidate("alice", []session.BreakpointSpec{
+		{Line: 2, Enabled: true, HitCount: 100},
+		{Line: 3, Enabled: true, Condition: "missing > 1"},
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sess.AdoptCandidate("alice", candidate.ID, ""); err != nil {
+		t.Fatal(err)
+	}
+	entry := sess.Snapshot().PauseID
+	result, err := sess.ContinueEx("alice", entry, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Paused == nil || result.Paused.Reason != executor.ReasonConditionError {
+		t.Fatalf("continue = %+v, want immediate condition-error", result.Paused)
+	}
+	if result.Paused.ConditionError == "" {
+		t.Fatalf("diagnostic missing: %+v", result.Paused)
+	}
+	view := sess.BreakpointsView()
+	statuses := map[int]session.BreakpointStatus{}
+	for _, status := range view.Current {
+		statuses[status.Line] = status
+	}
+	if statuses[3].Hits != 0 || statuses[3].ConditionError == "" {
+		t.Fatalf("errored breakpoint = %+v, want zero hits with diagnostic", statuses[3])
+	}
+	if statuses[2].Hits < 1 {
+		t.Fatalf("sibling breakpoint passes lost: %+v", statuses[2])
+	}
+}
+
+// TestSpecChangeResetsCounterAndControlHandoffKeepsIt documents which
+// counts survive: changing the condition resets the line to zero, while a
+// controller handoff leaves versions and counters untouched.
+func TestSpecChangeResetsCounterAndControlHandoffKeepsIt(t *testing.T) {
+	sess := newSession(t, "loop")
+	defer sess.Close()
+	if _, err := sess.Attach("alice", true, false); err != nil {
+		t.Fatal(err)
+	}
+	entry := sess.Snapshot().PauseID
+	first, err := sess.StageCandidate("alice", []session.BreakpointSpec{
+		{Line: 2, Enabled: true},
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sess.AdoptCandidate("alice", first.ID, ""); err != nil {
+		t.Fatal(err)
+	}
+	stopped, err := sess.ContinueEx("alice", entry, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view := sess.BreakpointsView(); view.Current[0].Hits != 1 {
+		t.Fatalf("hits before change = %+v", view.Current)
+	}
+
+	// Change the condition: same line, new spec, counter restarts at zero.
+	changed, err := sess.StageCandidate("alice", []session.BreakpointSpec{
+		{Line: 2, Enabled: true, Condition: "i >= 0"},
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sess.AdoptCandidate("alice", changed.ID, ""); err != nil {
+		t.Fatal(err)
+	}
+	resumed, err := sess.ContinueEx("alice", stopped.Paused.PauseID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resumed.Paused == nil {
+		t.Fatalf("continue = %+v", resumed)
+	}
+	if view := sess.BreakpointsView(); view.Current[0].Hits != 1 {
+		t.Fatalf("new condition must count from zero: %+v", view.Current)
+	}
+
+	// Control handoff keeps the exact books; the new controller sees the
+	// same version, counters, and pause basis.
+	sess.Detach("alice")
+	if _, err := sess.Attach("bob", true, false); err != nil {
+		t.Fatal(err)
+	}
+	view := sess.BreakpointsView()
+	if view.Current[0].Hits != 1 {
+		t.Fatalf("handoff altered hits: %+v", view.Current)
+	}
+	if snap := sess.Snapshot(); snap.HitCount != resumed.Paused.HitCount {
+		t.Fatalf("handoff altered pause basis: %+v", snap)
 	}
 }

@@ -65,6 +65,13 @@ type Executor interface {
 	// point. It returns false when the executor has already exited; in that
 	// case it must not block.
 	UpdateBreakpoints(breakpoints map[int]Breakpoint) bool
+	// HitCounts returns the number of condition passes accumulated per
+	// breakpoint line under the currently installed set, including passes
+	// since the last stop that did not reach the hit-count target. Counts
+	// carry over while a breakpoint spec is unchanged; a changed,
+	// re-enabled, or re-added breakpoint restarts from zero, and removed
+	// lines are absent. It is safe to call concurrently with execution.
+	HitCounts() map[int]int
 	// Done is closed when the executor has exited.
 	Done() <-chan struct{}
 	// Shutdown stops a paused executor and makes it emit terminated.

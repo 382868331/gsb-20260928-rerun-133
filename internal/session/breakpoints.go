@@ -40,6 +40,10 @@ type BreakpointSpec struct {
 // recorded while its version was in effect.
 type BreakpointStatus struct {
 	BreakpointSpec
+	// Hits is the number of times the breakpoint condition passed while
+	// the version was in effect, including passes that had not reached
+	// the hit-count target and therefore did not stop execution. It uses
+	// the same basis as the executor counters and pause records.
 	Hits           int    `json:"hits"`
 	ConditionError string `json:"conditionError,omitempty"`
 }
@@ -47,7 +51,8 @@ type BreakpointStatus struct {
 // VersionRecord is one adopted breakpoint version. EffectivePauseID names
 // the pause whose continue first ran with this version, so every pause can
 // be checked against the version that actually produced it. Hits archives
-// the per-line hit counts accumulated while the version was active.
+// the per-line condition-pass counts accumulated while the version was
+// active (reconciled with the executor before archiving).
 type VersionRecord struct {
 	ID               int              `json:"id"`
 	Breakpoints      []BreakpointSpec `json:"breakpoints"`
@@ -360,6 +365,13 @@ func (s *Session) AdoptCandidate(clientID string, candidateID int, requestID str
 // continue; while running it is pushed to the executor at the next safe
 // point.
 func (s *Session) installVersionLocked(specs []BreakpointSpec, adoptedBy string) VersionRecord {
+	// Reconcile the outgoing version one last time: hits that passed since
+	// its last stop (including passes short of a hit-count target) belong
+	// to its history. While stopped the executor counters are the exact
+	// per-version basis; while running a newer version may already be
+	// installed there, in which case sync is a no-op and the outgoing
+	// version keeps what its last stop recorded.
+	s.syncHitsLocked()
 	s.bpHistory = append(s.bpHistory, VersionRecord{
 		ID:               s.bpVersion,
 		Breakpoints:      cloneSpecs(s.bpSpecs),
@@ -371,11 +383,16 @@ func (s *Session) installVersionLocked(specs []BreakpointSpec, adoptedBy string)
 	s.bpSpecs = cloneSpecs(specs)
 	s.bpAdoptedBy = adoptedBy
 	s.bpEffectivePause = s.pauseID
+	// Seed the new version from the executor's raw counters so a version
+	// pushed to a running executor at a safe point keeps the counters the
+	// engine carried over for unchanged specs (spec change / removal / new
+	// line already reset or dropped them there).
 	s.bpHits = map[int]int{}
 	s.bpCondErrs = map[int]string{}
 	if s.state == StateRunning {
 		s.bpPendingVersion = s.bpVersion
 		s.engine.UpdateBreakpoints(executorBreakpoints(s.bpSpecs))
+		s.syncHitsLocked()
 	}
 	return VersionRecord{
 		ID:               s.bpVersion,

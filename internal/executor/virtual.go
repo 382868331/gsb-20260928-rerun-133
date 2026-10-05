@@ -122,6 +122,20 @@ func (v *Virtual) UpdateBreakpoints(breakpoints map[int]Breakpoint) bool {
 	return true
 }
 
+// HitCounts returns a copy of the raw condition-pass counters, one entry
+// per installed breakpoint line. A hit is every condition pass, including
+// passes that have not yet reached a hit-count target, so callers can
+// reconcile their books with the executor after a run that produced no stop.
+func (v *Virtual) HitCounts() map[int]int {
+	v.breakpointMu.RLock()
+	defer v.breakpointMu.RUnlock()
+	counts := make(map[int]int, len(v.hitCounts))
+	for line, count := range v.hitCounts {
+		counts[line] = count
+	}
+	return counts
+}
+
 func (v *Virtual) Done() <-chan struct{} { return v.done }
 
 func (v *Virtual) Shutdown() {

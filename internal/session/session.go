@@ -122,9 +122,10 @@ type Session struct {
 	bpPendingVersion int
 	bpAdoptedBy      string
 	bpEffectivePause int
-	// bpHits and bpCondErrs accumulate hits and condition diagnostics for
-	// the current version only; they are archived into bpHistory when a
-	// new version is installed.
+	// bpHits and bpCondErrs accumulate raw condition-pass counts and
+	// condition diagnostics for the current version only; they are
+	// reconciled with the executor on every stop and archived into
+	// bpHistory when a new version is installed.
 	bpHits     map[int]int
 	bpCondErrs map[int]string
 	bpHistory  []VersionRecord
@@ -255,11 +256,21 @@ func (s *Session) onEvent(event executor.Event) {
 		s.bpPauseVersion = s.bpPendingVersion
 		switch event.Reason {
 		case executor.ReasonBreakpoint:
-			s.bpHits[event.Line]++
+			// Take the raw condition-pass counters from the executor so the
+			// books explain every stop: with hitCount N the Nth pass pauses,
+			// and counters of other breakpoints that passed without firing
+			// since the last stop are reconciled as well.
+			s.syncHitsLocked()
 		case executor.ReasonConditionError:
-			// A broken condition keeps its diagnostic; it is neither a
-			// hit nor a silent miss.
+			// A broken condition keeps its diagnostic; it is neither a hit
+			// nor a silent miss. Other breakpoints may still have advanced
+			// (silently) before this stop, so reconcile their counters too.
+			s.syncHitsLocked()
 			s.bpCondErrs[event.Line] = event.ConditionError
+		case executor.ReasonPause:
+			// A client-requested boundary stop can land after hits that did
+			// not reach their targets; reconcile those counters.
+			s.syncHitsLocked()
 		}
 		s.flagCandidatesOnPauseLocked()
 		s.lastPause = &Snapshot{
@@ -320,6 +331,28 @@ func (s *Session) lastPauseRef() *Snapshot {
 		ref.Vars = cloneVars(s.lastPause.Vars)
 	}
 	return &ref
+}
+
+// syncHitsLocked reconciles the session's per-breakpoint condition-pass
+// counters with the executor's raw counters. Every condition pass is a hit,
+// including passes that did not reach a hit-count target and therefore never
+// produced a stop; the session cannot learn about those from stop events
+// alone, so it adopts the executor counters for the breakpoints of the
+// currently pending version. Counters only advance; lines dropped or reset
+// by the executor (spec change, removal) start from their executor value.
+// Breakpoints installed by a newer version adopted while running are ignored
+// until that version becomes the pause version, keeping one consistent basis
+// for the current view, adopted versions, and pause records.
+func (s *Session) syncHitsLocked() {
+	raw := s.engine.HitCounts()
+	if s.bpPauseVersion != s.bpPendingVersion {
+		// The executor is already running a newer adopted version; its
+		// counters belong to that version, not to the one still on record.
+		return
+	}
+	for _, spec := range s.bpSpecs {
+		s.bpHits[spec.Line] = raw[spec.Line]
+	}
 }
 
 func (s *Session) submit(apply func(*Session)) {
