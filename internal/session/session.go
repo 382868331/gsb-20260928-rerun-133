@@ -255,7 +255,10 @@ func (s *Session) onEvent(event executor.Event) {
 		s.bpPauseVersion = s.bpPendingVersion
 		switch event.Reason {
 		case executor.ReasonBreakpoint:
-			s.bpHits[event.Line]++
+			// The executor's count is authoritative: it records every
+			// hit that participated in the hit-count constraint, not
+			// just the ones that produced a pause.
+			s.bpHits[event.Line] = event.HitCount
 		case executor.ReasonConditionError:
 			// A broken condition keeps its diagnostic; it is neither a
 			// hit nor a silent miss.
@@ -484,7 +487,10 @@ func (s *Session) ContinueEx(clientID string, pauseID int, requestID string) (Co
 			}
 			currentPauseID := s.pauseID
 			s.waiters[w] = struct{}{}
-			s.engine.UpdateBreakpoints(executorBreakpoints(s.bpSpecs))
+			// A version installed while stopped has not been pushed yet;
+			// its hit counts restart from zero on this continue.
+			resetHits := s.bpPendingVersion != s.bpVersion
+			s.engine.UpdateBreakpoints(executorBreakpoints(s.bpSpecs), resetHits)
 			s.state = StateRunning
 			s.pauseID = 0
 			s.bpPendingVersion = s.bpVersion

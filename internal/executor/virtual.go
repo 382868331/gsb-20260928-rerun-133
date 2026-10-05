@@ -103,7 +103,7 @@ func (v *Virtual) Resume(pauseID int, _ map[int]Breakpoint) {
 	}
 }
 
-func (v *Virtual) UpdateBreakpoints(breakpoints map[int]Breakpoint) bool {
+func (v *Virtual) UpdateBreakpoints(breakpoints map[int]Breakpoint, resetHits bool) bool {
 	v.breakpointMu.Lock()
 	defer v.breakpointMu.Unlock()
 	select {
@@ -112,9 +112,11 @@ func (v *Virtual) UpdateBreakpoints(breakpoints map[int]Breakpoint) bool {
 	default:
 	}
 	counts := make(map[int]int, len(breakpoints))
-	for line, bp := range breakpoints {
-		if old, ok := v.breakpoints[line]; ok && old == bp {
-			counts[line] = v.hitCounts[line]
+	if !resetHits {
+		for line, bp := range breakpoints {
+			if old, ok := v.breakpoints[line]; ok && old == bp {
+				counts[line] = v.hitCounts[line]
+			}
 		}
 	}
 	v.hitCounts = counts

@@ -359,11 +359,11 @@ func TestHitCountCandidatePauseBasis(t *testing.T) {
 		t.Fatalf("snapshot hit count = %d, want 3", snap.HitCount)
 	}
 
-	// The preview shows the hit target on the current version and the
-	// stop counted as one hit for that version.
+	// The preview shows the hit target on the current version, and the
+	// recorded hits match the count the pause actually fired on.
 	view := sess.BreakpointsView()
-	if len(view.Current) != 1 || view.Current[0].HitCount != 3 || view.Current[0].Hits != 1 {
-		t.Fatalf("current = %+v, want hitCount 3 with 1 recorded hit", view.Current)
+	if len(view.Current) != 1 || view.Current[0].HitCount != 3 || view.Current[0].Hits != 3 {
+		t.Fatalf("current = %+v, want hitCount 3 with 3 recorded hits", view.Current)
 	}
 
 	// A second continue fires again on the next multiple of the target.
@@ -373,5 +373,102 @@ func TestHitCountCandidatePauseBasis(t *testing.T) {
 	}
 	if again.Paused == nil || again.Paused.HitCount != 6 {
 		t.Fatalf("second pause = %+v, want hit 6", again)
+	}
+	if view := sess.BreakpointsView(); view.Current[0].Hits != 6 {
+		t.Fatalf("current hits = %+v, want 6 recorded hits", view.Current)
+	}
+}
+
+func TestHitCountRestartsOnNewVersion(t *testing.T) {
+	sess := newSession(t, "loop")
+	defer sess.Close()
+	if _, err := sess.Attach("alice", true, false); err != nil {
+		t.Fatal(err)
+	}
+	entry := sess.Snapshot()
+
+	first, err := sess.StageCandidate("alice", []session.BreakpointSpec{
+		{Line: 2, Enabled: true, HitCount: 2},
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sess.AdoptCandidate("alice", first.ID, ""); err != nil {
+		t.Fatal(err)
+	}
+	paused, err := sess.ContinueEx("alice", entry.PauseID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if paused.Paused == nil || paused.Paused.HitCount != 2 {
+		t.Fatalf("first pause = %+v, want hit 2", paused)
+	}
+
+	// Adopting an identical spec as a new version archives the old hits
+	// and restarts the count: the next pause fires on hit 2 of the new
+	// version, not on the carried-over hit 4.
+	second, err := sess.StageCandidate("alice", []session.BreakpointSpec{
+		{Line: 2, Enabled: true, HitCount: 2},
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := sess.AdoptCandidate("alice", second.ID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resumed, err := sess.ContinueEx("alice", paused.Paused.PauseID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resumed.Paused == nil || resumed.Paused.HitCount != 2 || resumed.Paused.BreakpointVersion != record.ID {
+		t.Fatalf("second pause = %+v, want hit 2 under version %d", resumed, record.ID)
+	}
+
+	view := sess.BreakpointsView()
+	var archived *session.VersionRecord
+	for i := range view.History {
+		if view.History[i].ID == record.ID-1 {
+			archived = &view.History[i]
+		}
+	}
+	if archived == nil || archived.Hits[2] != 2 {
+		t.Fatalf("archived hits = %+v, want 2 hits on the replaced version", view.History)
+	}
+	if len(view.Current) != 1 || view.Current[0].Hits != 2 {
+		t.Fatalf("current = %+v, want 2 hits on the new version", view.Current)
+	}
+}
+
+func TestControlHandoverKeepsHitCounts(t *testing.T) {
+	sess := newSession(t, "loop")
+	defer sess.Close()
+	if _, err := sess.Attach("alice", true, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sess.SetBreakpointsEx("alice", []int{2}, ""); err != nil {
+		t.Fatal(err)
+	}
+	entry := sess.Snapshot().PauseID
+	if _, err := sess.ContinueEx("alice", entry, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// Control moves to bob; the hit records and candidate baselines are
+	// session state and survive the handover unchanged.
+	sess.Detach("alice")
+	if _, err := sess.Attach("bob", true, false); err != nil {
+		t.Fatal(err)
+	}
+	view := sess.BreakpointsView()
+	if len(view.Current) != 1 || view.Current[0].Hits != 1 {
+		t.Fatalf("hits lost on handover: %+v", view.Current)
+	}
+	paused := sess.Snapshot()
+	if _, err := sess.ContinueEx("bob", paused.PauseID, ""); err != nil {
+		t.Fatal(err)
+	}
+	if view := sess.BreakpointsView(); view.Current[0].Hits != 2 {
+		t.Fatalf("hits after handover continue = %+v, want 2", view.Current)
 	}
 }

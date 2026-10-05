@@ -15,7 +15,7 @@ func TestBreakpointResume(t *testing.T) {
 	if entry.Reason != executor.ReasonEntry {
 		t.Fatalf("entry = %+v", entry)
 	}
-	if !v.UpdateBreakpoints(map[int]executor.Breakpoint{2: {Line: 2, Enabled: true}}) {
+	if !v.UpdateBreakpoints(map[int]executor.Breakpoint{2: {Line: 2, Enabled: true}}, false) {
 		t.Fatal("update failed")
 	}
 	v.Resume(entry.PauseID, map[int]executor.Breakpoint{2: {Line: 2, Enabled: true}})
@@ -32,7 +32,7 @@ func TestConditionErrorStopsWithDiagnostic(t *testing.T) {
 	v.Start(events)
 	entry := <-events
 	bps := map[int]executor.Breakpoint{2: {Line: 2, Enabled: true, Condition: "missing > 1"}}
-	if !v.UpdateBreakpoints(bps) {
+	if !v.UpdateBreakpoints(bps, false) {
 		t.Fatal("update failed")
 	}
 	v.Resume(entry.PauseID, bps)
@@ -52,7 +52,7 @@ func TestHitCountStopsOnNthHit(t *testing.T) {
 	v.Start(events)
 	entry := <-events
 	bps := map[int]executor.Breakpoint{2: {Line: 2, Enabled: true, HitCount: 3}}
-	if !v.UpdateBreakpoints(bps) {
+	if !v.UpdateBreakpoints(bps, false) {
 		t.Fatal("update failed")
 	}
 	v.Resume(entry.PauseID, bps)
@@ -74,7 +74,7 @@ func TestConditionErrorStopsBeforeHitCountReached(t *testing.T) {
 	v.Start(events)
 	entry := <-events
 	bps := map[int]executor.Breakpoint{2: {Line: 2, Enabled: true, Condition: "missing > 1", HitCount: 100}}
-	if !v.UpdateBreakpoints(bps) {
+	if !v.UpdateBreakpoints(bps, false) {
 		t.Fatal("update failed")
 	}
 	v.Resume(entry.PauseID, bps)
@@ -91,7 +91,7 @@ func TestHitCountsResetOnSpecChange(t *testing.T) {
 	v.Start(events)
 	entry := <-events
 	bps := map[int]executor.Breakpoint{2: {Line: 2, Enabled: true, HitCount: 2}}
-	if !v.UpdateBreakpoints(bps) {
+	if !v.UpdateBreakpoints(bps, false) {
 		t.Fatal("update failed")
 	}
 	v.Resume(entry.PauseID, bps)
@@ -100,7 +100,7 @@ func TestHitCountsResetOnSpecChange(t *testing.T) {
 		t.Fatalf("first stop = %+v, want hit 2", first)
 	}
 	// Reinstalling the identical spec keeps the accumulated count.
-	if !v.UpdateBreakpoints(bps) {
+	if !v.UpdateBreakpoints(bps, false) {
 		t.Fatal("update failed")
 	}
 	v.Resume(first.PauseID, bps)
@@ -110,12 +110,22 @@ func TestHitCountsResetOnSpecChange(t *testing.T) {
 	}
 	// Changing the condition restarts the count from zero.
 	changed := map[int]executor.Breakpoint{2: {Line: 2, Enabled: true, Condition: "i > 0", HitCount: 2}}
-	if !v.UpdateBreakpoints(changed) {
+	if !v.UpdateBreakpoints(changed, false) {
 		t.Fatal("update failed")
 	}
 	v.Resume(second.PauseID, changed)
 	third := <-events
 	if third.HitCount != 2 {
 		t.Fatalf("third stop = %+v, want hit 2 after spec change", third)
+	}
+	// A new version reinstalls even an identical spec with resetHits:
+	// the count restarts from zero.
+	if !v.UpdateBreakpoints(changed, true) {
+		t.Fatal("update failed")
+	}
+	v.Resume(third.PauseID, changed)
+	fourth := <-events
+	if fourth.HitCount != 2 {
+		t.Fatalf("fourth stop = %+v, want hit 2 after version reset", fourth)
 	}
 }

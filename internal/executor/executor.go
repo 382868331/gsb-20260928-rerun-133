@@ -63,8 +63,12 @@ type Executor interface {
 	Pause()
 	// UpdateBreakpoints installs a complete breakpoint set at the next safe
 	// point. It returns false when the executor has already exited; in that
-	// case it must not block.
-	UpdateBreakpoints(breakpoints map[int]Breakpoint) bool
+	// case it must not block. resetHits reports that a new breakpoint
+	// version is being installed: every accumulated hit count restarts
+	// from zero. When resetHits is false (the same version re-pushed on
+	// continue), counts for breakpoints whose spec is unchanged carry
+	// over, while changed, re-enabled, or re-added specs restart.
+	UpdateBreakpoints(breakpoints map[int]Breakpoint, resetHits bool) bool
 	// Done is closed when the executor has exited.
 	Done() <-chan struct{}
 	// Shutdown stops a paused executor and makes it emit terminated.

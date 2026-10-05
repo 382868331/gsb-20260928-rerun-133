@@ -375,7 +375,7 @@ func (s *Session) installVersionLocked(specs []BreakpointSpec, adoptedBy string)
 	s.bpCondErrs = map[int]string{}
 	if s.state == StateRunning {
 		s.bpPendingVersion = s.bpVersion
-		s.engine.UpdateBreakpoints(executorBreakpoints(s.bpSpecs))
+		s.engine.UpdateBreakpoints(executorBreakpoints(s.bpSpecs), true)
 	}
 	return VersionRecord{
 		ID:               s.bpVersion,
